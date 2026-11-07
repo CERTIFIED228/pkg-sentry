@@ -73,59 +73,68 @@ GYP_HARMLESS = re.compile(r"^node\s+-[pe]\s+['\"]?require\(['\"][\w@/.-]+['\"]\)
 REGEX_AFTER = set("(,=:[!&|?{};+-*%<>~^") | {""}
 
 
+TOKEN_START = re.compile(r"['\"`/]")
+STRING_STOP = {q: re.compile(r"[\\" + q + (r"]" if q == "`" else r"\n]")) for q in "'\"`"}
+REGEX_STOP = re.compile(r"[\\\n\[\]/]")
+
+
 def strip_comments(source: str) -> str:
-    """Comments replaced by spaces (newlines kept), strings and regexes left alone."""
-    out = list(source)
-    i, n = 0, len(source)
+    """Comments replaced by spaces (newlines kept), strings and regexes left
+    alone. Jumps from one quote or slash to the next with regexes, because
+    minified bundles run to megabytes."""
+    pieces: list[str] = []
+    copied = 0  # source[copied:] hasn't been added to pieces yet
+    mark = 0  # end of the last string, comment or regex
     last = ""  # last significant character outside comments
-    while i < n:
-        c = source[i]
-        if c in "'\"`":
-            i = _skip_string(source, i, c)
+    i, n = 0, len(source)
+    while (m := TOKEN_START.search(source, i)) is not None:
+        j = m.start()
+        code = source[mark:j].rstrip()
+        if code:
+            last = code[-1]
+        c = source[j]
+        if c != "/":
+            i = mark = _skip_string(source, j, c)
             last = c
             continue
-        if c == "/" and i + 1 < n:
-            nxt = source[i + 1]
+        nxt = source[j + 1:j + 2]
+        if nxt in ("/", "*"):
             if nxt == "/":
-                end = source.find("\n", i)
+                end = source.find("\n", j)
                 end = n if end < 0 else end
-                out[i:end] = " " * (end - i)
-                i = end
-                continue
-            if nxt == "*":
-                end = source.find("*/", i + 2)
+            else:
+                end = source.find("*/", j + 2)
                 end = n if end < 0 else end + 2
-                out[i:end] = [ch if ch == "\n" else " " for ch in source[i:end]]
-                i = end
-                continue
-            if last in REGEX_AFTER or _after_keyword(source, i):
-                i = _skip_regex(source, i)
-                last = "/"
-                continue
-        if not c.isspace():
-            last = c
-        i += 1
-    return "".join(out)
+            comment = source[j:end]
+            pieces += [source[copied:j], re.sub(r"[^\n]", " ", comment)]
+            i = mark = copied = end
+            continue
+        if last in REGEX_AFTER or _after_keyword(source, j):
+            i = mark = _skip_regex(source, j)
+            last = "/"
+            continue
+        i = j + 1
+        mark, last = i, "/"
+    pieces.append(source[copied:])
+    return "".join(pieces)
 
 
 def _skip_string(source: str, i: int, quote: str) -> int:
+    stop = STRING_STOP[quote]
     i += 1
-    while i < len(source):
-        c = source[i]
-        if c == "\\":
-            i += 2
+    while (m := stop.search(source, i)) is not None:
+        if m.group() == "\\":
+            i = m.start() + 2
             continue
-        if c == quote or (c == "\n" and quote != "`"):
-            return i + 1
-        i += 1
-    return i
+        return m.start() + 1
+    return len(source)
 
 
 def _skip_regex(source: str, i: int) -> int:
     i += 1
     in_class = False
-    while i < len(source):
-        c = source[i]
+    while (m := REGEX_STOP.search(source, i)) is not None:
+        c, i = m.group(), m.start()
         if c == "\\":
             i += 2
             continue
@@ -135,10 +144,10 @@ def _skip_regex(source: str, i: int) -> int:
             in_class = True
         elif c == "]":
             in_class = False
-        elif c == "/" and not in_class:
+        elif not in_class:
             return i + 1
         i += 1
-    return i
+    return len(source)
 
 
 def _after_keyword(source: str, i: int) -> bool:

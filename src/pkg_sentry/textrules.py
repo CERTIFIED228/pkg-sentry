@@ -120,6 +120,31 @@ GATES = {
 PER_RULE = 20
 
 
+BIG_TEXT = 200_000
+WINDOW = 600
+
+
+def _windows(lower: str, words) -> list[tuple[int, int]]:
+    spans = []
+    for word in words:
+        at = lower.find(word)
+        while at >= 0 and len(spans) < 20_000:
+            spans.append((max(0, at - WINDOW), at + len(word) + WINDOW))
+            at = lower.find(word, at + len(word))
+    merged: list[list[int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(a, b) for a, b in merged]
+
+
+def _near(pattern, text: str, windows):
+    for start, end in windows:
+        yield from pattern.finditer(text, start, end)
+
+
 def line_finder(text: str):
     """offset -> line number, without recounting newlines for every match."""
     starts: list[int] = []
@@ -141,6 +166,12 @@ def check_text(text: str, path: str, line_of=None, install_time: bool = False) -
     found = []
     counts: dict[str, int] = {}
 
+    def scan(pattern, gate_name):
+        if len(text) < BIG_TEXT:
+            return pattern.finditer(text)
+        # Megabyte bundles: only look near the words the pattern needs.
+        return _near(pattern, text, _windows(lower, GATES[gate_name]))
+
     def add(rule, message, match, critical=False, points=None):
         counts[rule] = counts.get(rule, 0) + 1
         if counts[rule] > PER_RULE:
@@ -155,41 +186,41 @@ def check_text(text: str, path: str, line_of=None, install_time: bool = False) -
     weaker_powershell = None if install_time else 20
 
     if gate["exfil"]:
-        for m in EXFIL.finditer(text):
+        for m in scan(EXFIL, "exfil"):
             add("exfil-endpoint", f"sends data to {m.group(0).split('/')[0]}", m,
                 critical=install_time)
-        for m in DROPS.finditer(text):
+        for m in scan(DROPS, "exfil"):
             add("exfil-endpoint", f"uploads to {m.group(0).split('/')[0]}", m,
                 critical=install_time, points=weaker)
     if gate["loot"]:
-        for m in STOLEN_GOODS.finditer(text):
+        for m in scan(STOLEN_GOODS, "loot"):
             add("secrets", f"reads {m.group(0)}", m)
     if gate["creds"]:
-        for m in CREDENTIALS.finditer(text):
+        for m in scan(CREDENTIALS, "creds"):
             add("credentials", f"reads {m.group(0)}", m)
     if gate["powershell"]:
         # The command is often built a few lines above the call, so look at the
         # whole file for the hiding/downloading part.
         hiding = POWERSHELL_HIDING.search(text)
-        for m in POWERSHELL.finditer(text):
+        for m in scan(POWERSHELL, "powershell"):
             if hiding or POWERSHELL_IEX.search(text, m.start(), m.start() + 300):
                 add("hidden-powershell", "starts PowerShell hidden or with encoded commands", m,
                     critical=install_time, points=weaker_powershell)
     if gate["pipe"]:
-        for m in PIPE_TO_SHELL.finditer(text):
+        for m in scan(PIPE_TO_SHELL, "pipe"):
             add("download-exec", "downloads a script or program and runs it", m,
                 critical=install_time, points=weaker)
     if gate["decode"]:
-        for m in DECODE_TO_SHELL.finditer(text):
+        for m in scan(DECODE_TO_SHELL, "decode"):
             add("exec-decoded", "decodes a hidden command and runs it", m, critical=install_time)
     if gate["uninstall"] and install_time:
-        for m in SELF_UNINSTALL.finditer(text):
+        for m in scan(SELF_UNINSTALL, "uninstall"):
             add("hides-traces", "uninstalls a package while installing, to cover its tracks", m)
     if gate["persist"]:
-        for m in PERSISTENCE.finditer(text):
+        for m in scan(PERSISTENCE, "persist"):
             add("persistence", "sets itself up to start again later", m)
     if gate["ip"]:
-        for m in URL_IP.finditer(text):
+        for m in scan(URL_IP, "ip"):
             if public_ip(m.group(1)):
                 add("raw-ip-url", f"talks to the bare IP address {m.group(1)}", m)
     return found
