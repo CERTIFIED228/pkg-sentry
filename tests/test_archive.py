@@ -1,3 +1,4 @@
+import gzip
 import io
 import tarfile
 import zipfile
@@ -159,7 +160,9 @@ def test_npm_layout_drops_the_first_folder_of_every_entry():
 @pytest.mark.parametrize(
     "name, expected",
     [("package/index.js", "index.js"), ("./x/index.js", "x/index.js"), ("index.js", ""),
-     ("a//b/c.js", "b/c.js"), ("package\\lib\\a.js", "lib/a.js"), ("package/../x", None)],
+     ("a//b/c.js", "b/c.js"), ("package/../x", None),
+     # only "/" separates folders, the way npm reads it on Linux and macOS
+     ("package\\lib\\a.js", ""), ("z\\tests/index.js", "index.js")],
 )
 def test_npm_paths(name, expected):
     assert npm_path(name) == expected
@@ -187,3 +190,46 @@ def test_corrupt_zip_member_is_reported_not_raised():
     data[start:start + 40] = b"\xff" * 40
     result = unpack(bytes(data))
     assert any("can't be read" in why for _, why in result.skipped)
+
+
+def test_backslashes_in_npm_paths_are_suspicious():
+    # On Linux, npm reads "z\tests/index.js" as a folder called "z\tests".
+    data = make_tar([("package/package.json", b"{}"), ("z\\tests/index.js", b"x")])
+    result = unpack(data, npm=True)
+    assert {f.path for f in result.files} == {"package.json", "index.js"}
+    assert result.suspicious == [("z\\tests/index.js", "has a backslash in its path")]
+
+
+def raw_tar(members, end=True):
+    """An uncompressed tar, optionally without its end-of-archive blocks."""
+    data = make_tar(members, mode="w")
+    if end:
+        return data
+    data = data.rstrip(b"\0")
+    return data + b"\0" * (-len(data) % 512)
+
+
+def test_every_gzip_member_is_read():
+    first = raw_tar([("x-1.0/setup.py", b"benign")], end=False)
+    second = raw_tar([("x-1.0/setup.py", b"evil")])
+    data = gzip.compress(first) + gzip.compress(second)
+    files = {f.path: f.data for f in unpack(data).strip_top_dir().files}
+    assert files == {"setup.py": b"evil"}
+
+
+@pytest.mark.parametrize("gap", [b"\0" * 512, b"garbage".ljust(512, b"\0")])
+def test_entries_hidden_after_where_python_stops_reading(gap):
+    first = raw_tar([("package/index.js", b"benign")], end=False)
+    second = raw_tar([("package/index.js", b"evil")])
+    result = unpack(gzip.compress(first + gap + second), npm=True)
+    assert ("*", "there's more data after where the archive seems to end") in result.skipped
+
+
+def test_a_normal_tarball_has_nothing_after_its_end():
+    assert unpack(make_tar([("package/index.js", b"x")]), npm=True).skipped == []
+    assert unpack(raw_tar([("package/index.js", b"x")]), npm=True).skipped == []
+
+
+def test_data_after_the_gzip_stream():
+    result = unpack(make_tar([("package/index.js", b"x")]) + b"trailing junk", npm=True)
+    assert ("*", "there's data after the compressed archive") in result.skipped
