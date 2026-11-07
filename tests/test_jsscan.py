@@ -112,12 +112,17 @@ def test_obfuscated_code():
 
 
 def test_commented_out_code_is_ignored():
-    found = js_rules('''
+    found = js_rules("""
         // const cp = require('child_process'); cp.exec('rm -rf /')
-        /* https://discord.com/api/webhooks/1/abc */
+        /* eval(atob('ZXZhbA==')) */
         module.exports = 1;
-    ''')
+    """)
     assert found == []
+
+
+def test_urls_in_comments_still_count():
+    # If the comment scanner were ever fooled, a webhook must not disappear with it.
+    assert js_rules("/* https://discord.com/api/webhooks/1/abc */") == ["exfil-endpoint"]
 
 
 def test_urls_with_double_slash_survive_comment_stripping():
