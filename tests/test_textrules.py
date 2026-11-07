@@ -169,3 +169,8 @@ def test_elixirs_iex_next_to_a_powershell_lexer_is_fine():
     text = "'PowerShellLexer': ('pygments.lexers.shell', 'PowerShell'),\n" + "x\n" * 200 + \
            "'IexLexer': ('pygments.lexers.erlang', 'Elixir iex session')"
     assert rules(text) == []
+
+
+def test_shadow_file_mentioned_in_docs_isnt_reading_it():
+    assert rules("Hashes in the format found in /etc/shadow on most Unix systems.") == []
+    assert "secrets" in rules("open('/etc/shadow').read()")

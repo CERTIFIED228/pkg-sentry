@@ -37,7 +37,8 @@ STOLEN_GOODS = re.compile(
     r"|Telegram Desktop" + SEP + r"tdata|\bwallet\.dat\b|\bExodus" + SEP + r"exodus\.wallet"
     r"|\bElectrum" + SEP + r"wallets|\bAtomic" + SEP + r"Local Storage"
     r"|nkbihfbeogaeaoehlefnkodbefgpgknn"  # MetaMask's extension id
-    r"|/etc/shadow\b|login\.keychain-db"
+    # /etc/shadow as a string in code, not a password library's docs about it
+    r"|(?<=['\"])/etc/shadow(?=['\"])|login\.keychain-db"
 )
 # Credentials that plenty of honest tools read (the AWS SDK reads ~/.aws).
 CREDENTIALS = re.compile(
