@@ -201,3 +201,11 @@ def test_registry_errors_are_reported():
     report = Checker(FakeRegistry(error=http.FetchError("timed out")), FakeOSV()).check(
         PackageSpec("pypi", "x"))
     assert report.error.startswith("couldn't read the registry")
+
+
+def test_a_deleted_malicious_version_is_still_reported():
+    registry = FakeRegistry(error=VersionNotFound("ctx has no release 0.2.2 on PyPI"))
+    osv = FakeOSV(malware=[("MAL-2022-1", "Malicious code in ctx")])
+    report = Checker(registry, osv).check(PackageSpec("pypi", "ctx", "0.2.2"))
+    assert report.error is None and report.verdict.severity == "critical"
+    assert "ctx has no release 0.2.2 on PyPI any more" in report.verdict.notes

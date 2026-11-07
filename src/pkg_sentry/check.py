@@ -49,6 +49,11 @@ class Checker:
         except http.NotFound:
             pass
         except VersionNotFound as e:
+            # Registries delete malware, so a pinned version that's gone is
+            # still worth looking up.
+            known = self._known(spec, spec.version, notes)
+            if known:
+                return Report(spec, judge(known, [*notes, f"{e} any more"]))
             return Report(spec, judge([]), error=str(e))
         except (http.FetchError, KeyError, TypeError, ValueError) as e:
             return Report(spec, judge([]), error=f"couldn't read the registry: {e}")
