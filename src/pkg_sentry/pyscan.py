@@ -122,9 +122,10 @@ class _Visitor(ast.NodeVisitor):
     def visit_If(self, node):
         # `if __name__ == "__main__":` only runs when the file is run directly.
         test = node.test
-        is_main = (isinstance(test, ast.Compare) and isinstance(test.left, ast.Name)
-                   and test.left.id == "__name__"
-                   and any(_const(c) == "__main__" for c in test.comparators))
+        is_main = any(isinstance(n, ast.Compare) and isinstance(n.left, ast.Name)
+                      and n.left.id == "__name__"
+                      and any(_const(c) == "__main__" for c in n.comparators)
+                      for n in ast.walk(test))
         if not is_main:
             return self.generic_visit(node)
         self.visit(test)
@@ -268,7 +269,11 @@ class _Visitor(ast.NodeVisitor):
 
         if name in SHELL or name.startswith(SHELL_PREFIXES):
             if self.install_time and not _build_tool(args):
-                self.add("shell-at-install", f"runs commands {when}", node)
+                # A command spelled out in the code is clearer evidence than
+                # one assembled from variables (often a compiler invocation).
+                spelled_out = bool(args) and _const_command(args[0])
+                self.add("shell-at-install", f"runs commands {when}", node,
+                         points=None if spelled_out else 15)
             else:
                 self.add("shell", "runs shell commands", node)
             strings = [_const(n) or "" for a in args for n in ast.walk(a)]
@@ -343,6 +348,12 @@ def _build_tool(args) -> bool:
         return isinstance(first, ast.Attribute) and first.attr == "executable"  # sys.executable
     program = command.split()[0] if command.split() else ""
     return program.rsplit("/", 1)[-1] in BUILD_TOOLS
+
+
+def _const_command(node) -> bool:
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return bool(node.elts) and all(_const(e) is not None for e in node.elts)
+    return _const(node) is not None
 
 
 def _const_arg(call: ast.Call) -> str | None:

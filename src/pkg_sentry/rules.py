@@ -42,6 +42,14 @@ RULES = {
     "binary-payload": (15, "ships a Windows program or script"),
 }
 
+# Things honest packages do too (esbuild downloads and runs a binary when it's
+# installed). On their own they can reach medium but never high: that takes
+# evidence, something that's hard to explain innocently.
+BEHAVIOUR = {"install-script", "install-hook", "shell-at-install", "network-at-install", "shell",
+             "exec-dynamic", "binary-payload", "credentials", "very-new", "new", "no-source",
+             "revived"}
+BEHAVIOUR_CAP = 45
+
 THRESHOLDS = (("high", 60), ("medium", 35), ("low", 15))
 SEVERITIES = ("none", "low", "medium", "high", "critical")
 
@@ -84,7 +92,9 @@ def judge(findings: list[Finding], notes: list[str] | None = None) -> Verdict:
     for f in findings:
         if f.rule not in best or f.value > best[f.rule].value:
             best[f.rule] = f
-    score = min(100, sum(f.value for f in best.values()))
+    behaviour = sum(f.value for f in best.values() if f.rule in BEHAVIOUR)
+    evidence = sum(f.value for f in best.values() if f.rule not in BEHAVIOUR)
+    score = min(100, min(behaviour, BEHAVIOUR_CAP) + evidence)
     critical = any(f.critical for f in findings)
     if critical:
         severity, score = "critical", max(score, 90)

@@ -30,6 +30,13 @@ def test_install_hook_running_shell():
     assert any(f.critical for f in findings)
 
 
+def test_node_e_hooks_point_at_the_file_they_require():
+    hook = "node -e \"try{require('./postinstall')}catch(e){}\""
+    findings, files = scan_package_json("package.json", pkg({"postinstall": hook}))
+    assert [f.rule for f in findings] == ["install-script"]
+    assert "postinstall.js" in files
+
+
 @pytest.mark.parametrize(
     "command",
     ["node-gyp rebuild", "prebuild-install || node-gyp rebuild", "husky install",
@@ -125,6 +132,8 @@ def test_urls_with_double_slash_survive_comment_stripping():
         "module.exports = s => eval('(' + s + ')');",
         "const k = Object.keys(process.env).filter(k => k.startsWith('MY_'));",
         "const b = Buffer.from(s, 'base64');",
+        "const https = require('https');\nspawn('x', [], { env: process.env });",
+        "const https = require('https');\nconst env = { ...process.env, DEBUG: '1' };",
     ],
 )
 def test_normal_library_code(code):

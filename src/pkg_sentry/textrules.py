@@ -23,14 +23,15 @@ EXFIL = re.compile(
 SEP = r"[/\\\\]+"
 # Stores no normal library has a reason to open: browsers, chat apps, wallets.
 STOLEN_GOODS = re.compile(
-    r"\bLogin Data\b|\bLocal State\b|\bWeb Data\b|Network" + SEP + r"Cookies\b"
-    r"|User Data" + SEP + r"Default" + SEP + r"Cookies\b|\bcookies\.sqlite\b|\bkey4\.db\b"
+    # Chrome/Edge profile files, as file names in a path or a string, not "local state" in prose
+    r"(?<=[/\\\\'\"])(?:Login Data|Local State|Web Data)(?=['\"/\\\\]|$)"
+    r"|Network" + SEP + r"Cookies\b|User Data" + SEP + r"Default" + SEP + r"Cookies\b"
+    r"|\bcookies\.sqlite\b|\bkey4\.db\b|\blogins\.json\b"
     r"|discord(?:canary|ptb)?" + SEP + r"Local Storage|Local Storage" + SEP + r"leveldb"
     r"|Telegram Desktop" + SEP + r"tdata|\bwallet\.dat\b|\bExodus" + SEP + r"exodus\.wallet"
     r"|\bElectrum" + SEP + r"wallets|\bAtomic" + SEP + r"Local Storage"
     r"|nkbihfbeogaeaoehlefnkodbefgpgknn"  # MetaMask's extension id
-    r"|/etc/shadow\b|login\.keychain|keychain-db",
-    re.IGNORECASE,
+    r"|/etc/shadow\b|login\.keychain-db"
 )
 # Credentials that plenty of honest tools read (the AWS SDK reads ~/.aws).
 CREDENTIALS = re.compile(
@@ -42,7 +43,7 @@ CREDENTIALS = re.compile(
 
 POWERSHELL = re.compile(r"powershell|pwsh", re.IGNORECASE)
 POWERSHELL_HIDING = re.compile(
-    r"\s-(?:e|en|enc|encodedcommand)\s|-w(?:indowstyle)?\s+h(?:idden)?\b|\biex\b|invoke-expression"
+    r"-w(?:indowstyle)?\s+h(?:idden)?\b|\biex\b|invoke-expression"
     r"|downloadstring|downloadfile|invoke-webrequest|frombase64string|-exec(?:utionpolicy)?\s+bypass",
     re.IGNORECASE,
 )
@@ -57,7 +58,7 @@ PIPE_TO_SHELL = re.compile(
 
 PERSISTENCE = re.compile(
     r"Start Menu[/\\\\]+Programs[/\\\\]+Startup|CurrentVersion[/\\\\]+Run(?:Once)?\b"
-    r"|schtasks(?:\.exe)?\s+/create|\bcrontab\s+-|/etc/cron\.|Library/LaunchAgents"
+    r"|schtasks(?:\.exe)?\s+/create|\bcrontab\s+-|Library/LaunchAgents"
     r"|systemctl\s+--user\s+enable|\bat\.exe\b"
     r"|>>\s*['\"]?(?:~|\$HOME)?/?\.(?:bashrc|zshrc|bash_profile|profile)\b"
     r"|\.(?:bashrc|zshrc|bash_profile)['\"]\)?\s*,\s*['\"]a",
@@ -89,7 +90,7 @@ GATES = {
     "powershell": ("powershell", "pwsh"),
     "pipe": ("curl", "wget", "iwr", "irm", "invoke-web", "invoke-rest", "certutil", "bitsadmin",
              "mshta"),
-    "persist": ("startup", "currentversion", "schtasks", "crontab", "/etc/cron", "launchagents",
+    "persist": ("startup", "currentversion", "schtasks", "crontab", "launchagents",
                 "systemctl", "at.exe", "bashrc", "zshrc", "bash_profile", ".profile"),
     "ip": ("://",),
 }
@@ -102,10 +103,14 @@ def check_text(text: str, path: str, line_of=None, install_time: bool = False) -
     gate = {name: any(word in lower for word in words) for name, words in GATES.items()}
     found = []
 
-    def add(rule, message, match, critical=False):
+    def add(rule, message, match, critical=False, points=None):
         start = max(0, match.start() - 30)
         found.append(Finding(rule, message, path, line_of(match.start()),
-                             snippet(text[start: match.end() + 30]), critical))
+                             snippet(text[start: match.end() + 30]), critical, points))
+
+    # At runtime these also turn up in honest code (install instructions in an
+    # error message, a tool that drives PowerShell), so they count for less.
+    weaker = None if install_time else 15
 
     if gate["exfil"]:
         for m in EXFIL.finditer(text):
@@ -122,11 +127,11 @@ def check_text(text: str, path: str, line_of=None, install_time: bool = False) -
             window = text[m.start(): m.start() + 300]
             if POWERSHELL_HIDING.search(window):
                 add("hidden-powershell", "starts PowerShell hidden or with encoded commands", m,
-                    critical=install_time)
+                    critical=install_time, points=weaker and 20)
     if gate["pipe"]:
         for m in PIPE_TO_SHELL.finditer(text):
             add("download-exec", "downloads a script or program and runs it", m,
-                critical=install_time)
+                critical=install_time, points=weaker)
     if gate["persist"]:
         for m in PERSISTENCE.finditer(text):
             add("persistence", "sets itself up to start again later", m)

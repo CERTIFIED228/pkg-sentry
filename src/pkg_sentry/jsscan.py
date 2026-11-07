@@ -13,11 +13,12 @@ from .textrules import check_text
 
 INSTALL_HOOKS = ("preinstall", "install", "postinstall", "prepare")
 HOOK_RUNS_FILE = re.compile(
-    r"\bnode\s+(?:-e\s+)?['\"]?([\w./@-]+\.(?:c|m)?js)\b|\bnode\s+([\w./-]+)"
+    r"\bnode\s+['\"]?([\w./@-]+\.(?:c|m)?js)\b|\bnode\s+(?!-)([\w./-]+)"
+    r"|require\(\s*\\?['\"]\.?/?([\w./-]+)\\?['\"]\s*\)"
 )
 HOOK_SHELL = re.compile(
     r"\b(?:curl|wget|nc|ncat|bash\s+-c|sh\s+-c|powershell|pwsh|cmd(?:\.exe)?\s+/c|python3?\s+-c)\b"
-    r"|/dev/tcp/|node\s+-e\b",
+    r"|/dev/tcp/",
     re.IGNORECASE,
 )
 # Install hooks that are part of how a lot of packages build.
@@ -40,9 +41,10 @@ DECODE = re.compile(
     r"Buffer\.from\([^)]*['\"](?:base64|hex)['\"]|\batob\s*\(|String\.fromCharCode\s*\("
     r"|decodeURIComponent\s*\(\s*escape|createDecipheriv\s*\(",
 )
+# The whole environment serialised. `env: process.env` for a child process is normal.
 ENV_DUMP = re.compile(
-    r"JSON\.stringify\(\s*process\.env\s*\)|Object\.(?:keys|entries|values)\(\s*process\.env\s*\)"
-    r"|\.\.\.process\.env\b|:\s*process\.env\s*[,}]|=\s*process\.env\s*;"
+    r"(?:JSON|querystring|qs)\.stringify\(\s*process\.env\s*\)"
+    r"|JSON\.stringify\(\s*\{[^;]*?:\s*process\.env\s*[,}]"
 )
 RECON = re.compile(r"\bos\.(?:hostname|userInfo|networkInterfaces|homedir)\s*\(")
 RUNNABLE = re.compile(
@@ -78,7 +80,7 @@ def scan_package_json(path: str, text: str) -> tuple[list[Finding], set[str]]:
         findings.append(Finding("install-script", f"runs '{command}' on install", path, line,
                                 snippet(command)))
         for m in HOOK_RUNS_FILE.finditer(command):
-            target = (m.group(1) or m.group(2)).lstrip("./")
+            target = next(g for g in m.groups() if g).lstrip("./")
             run_files |= {target, f"{target}.js", f"{target}/index.js"}
         if HOOK_SHELL.search(command):
             findings.append(Finding("shell-at-install", "the install script runs shell commands",
@@ -120,7 +122,9 @@ def scan_js(path: str, source: str, install_time: bool = False) -> list[Finding]
 
     if has_network:
         if has_child and (m := RUNNABLE.search(code)):
-            add("download-exec", "downloads a program and starts it", m, critical=install_time)
+            # Also what esbuild and friends do to fetch their binary, so it's
+            # a weaker sign than the shell one-liners in textrules.
+            add("download-exec", "downloads a program and starts it", m, points=25)
         if m := ENV_DUMP.search(code):
             add("env-dump", "collects all environment variables and sends them out", m)
         if m := RECON.search(code):

@@ -173,6 +173,25 @@ def test_main_guard_doesnt_run_on_import():
     assert [f.rule for f in found] == ["shell"]
 
 
+def test_main_guard_with_extra_conditions():
+    found = scan('''
+        import sys, pty
+        if sys.platform != "win32" and __name__ == "__main__":
+            pty.spawn(sys.argv[1:])
+    ''', role="import")
+    assert [f.rule for f in found] == ["shell"]
+
+
+def test_commands_built_from_variables_count_for_less():
+    found = scan('''
+        import subprocess
+        subprocess.check_call(" ".join(compiler) + " -march=native -E -")
+        subprocess.check_call("whoami")
+    ''', role="setup")
+    points = sorted(f.value for f in found if f.rule == "shell-at-install")
+    assert points == [15, 30]
+
+
 def test_build_tools_in_setup_are_only_a_weak_sign():
     found = rules('''
         import subprocess, sys

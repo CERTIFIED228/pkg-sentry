@@ -32,10 +32,10 @@ DEV_FILES = re.compile(r"^(?:test_.*\.py|conftest\.py|.*_tests?\.py|.*\.(?:test|
                        r"|make\.bat|gulpfile\.js|gruntfile\.js|karma\.conf\.js)$", re.IGNORECASE)
 # Code in tests, docs and build tooling doesn't run when someone installs or
 # uses the package, so only signs that are never innocent count there.
-STRONG = {"exec-decoded", "exfil-endpoint", "hidden-powershell", "disguised-binary", "pth-file",
-          "archive-escape"}
+STRONG = {"exfil-endpoint", "disguised-binary", "pth-file", "archive-escape"}
 PTH_CODE = re.compile(r"^\s*import\s", re.MULTILINE)
-PTH_DANGER = re.compile(r"exec|eval|b64decode|subprocess|urllib|socket|requests|__import__|compile")
+PTH_DANGER = re.compile(r"b64decode|base64|zlib|marshal|subprocess|os\.system|popen|urllib|urlopen"
+                        r"|socket|requests|http\.client|codecs\.decode|fromhex")
 SENDS_DATA = {"exfil-endpoint", "raw-ip-url", "network-at-install", "env-dump", "recon",
               "download-exec"}
 
@@ -124,18 +124,23 @@ def _check_pth(path: str, text: str) -> list[Finding]:
 
 
 def _combine(findings: list[Finding]) -> list[Finding]:
-    """Reading secrets is only theft if there's also a way to send them out.
+    """Reading secrets is only theft if the same file can also send them out.
     One kind of credential is normal for a tool (an AWS library reads ~/.aws);
     several kinds, or browser and wallet data, is what stealers collect."""
-    rules = {f.rule for f in findings}
-    looted = [f for f in findings if f.rule == "secrets"]
-    creds = [f for f in findings if f.rule == "credentials"]
-    kinds = {f.message.lower().replace("\\", "/") for f in creds}
-    if not (rules & SENDS_DATA) or not (looted or len(kinds) >= 2):
-        return []
-    first = (looted or creds)[0]
-    return [Finding("steals-secrets", "reads credentials and has a way to send them out",
-                    first.path, first.line, first.snippet, critical="exfil-endpoint" in rules)]
+    by_file: dict[str, list[Finding]] = {}
+    for f in findings:
+        by_file.setdefault(f.path or "", []).append(f)
+    extra = []
+    for path, found in by_file.items():
+        rules = {f.rule for f in found}
+        looted = [f for f in found if f.rule == "secrets"]
+        kinds = {f.message for f in found if f.rule == "credentials"}
+        if rules & SENDS_DATA and (looted or len(kinds) >= 2):
+            first = looted[0] if looted else next(f for f in found if f.rule == "credentials")
+            extra.append(Finding("steals-secrets", "reads credentials and can send them out",
+                                 path, first.line, first.snippet,
+                                 critical="exfil-endpoint" in rules))
+    return extra
 
 
 def _without_duplicates(findings: list[Finding]) -> list[Finding]:

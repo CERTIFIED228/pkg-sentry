@@ -122,6 +122,25 @@ def test_browser_data_plus_a_way_out_is_theft():
     assert theft.critical  # paired with a known exfil service
 
 
+def test_secrets_and_a_way_out_in_different_files_is_not_theft():
+    files = {"cookies.py": "p = 'Default/Network/Cookies'",
+             "sites.py": "SITES = ['https://gofile.io/d/']"}
+    assert "steals-secrets" not in rules(files)
+
+
+def test_honest_pth_files():
+    nspkg = ("import sys, types, os;p = os.path.join(sys._getframe(1).f_locals['sitedir'], "
+             "*('google',));importlib = __import__('importlib.util')")
+    auto = "import os; exec('try: __import__(\"x\").auto_install()\nexcept: pass')"
+    assert analyse(package({"x-nspkg.pth": nspkg, "auto.pth": auto})) == []
+
+
+def test_tests_folders_dont_count_decoding_tricks():
+    files = {"docs/_static/app.js": "eval(atob('ZXZhbA=='))",
+             "tests/test_ps.py": "cmd = 'powershell -w hidden -c iex(x)'"}
+    assert rules(files) == []
+
+
 def test_several_kinds_of_credentials_plus_a_way_out_is_theft():
     files = {"x.py": "import requests\na = '~/.aws/credentials'\nb = '~/.npmrc'\n"
                      "c = '~/.ssh/id_rsa'\nrequests.get('http://45.61.137.218/')"}

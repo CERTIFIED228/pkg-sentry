@@ -30,6 +30,19 @@ def test_score_is_capped():
     assert judge(every).score == 100
 
 
+def test_behaviour_alone_never_goes_past_medium():
+    busy = [Finding(r, r) for r in ("install-script", "shell-at-install", "network-at-install",
+                                    "binary-payload", "no-source")]
+    verdict = judge(busy)
+    assert verdict.score == 45 and verdict.severity == "medium"
+
+
+def test_evidence_on_top_of_behaviour_counts_in_full():
+    found = [Finding("shell-at-install", "x"), Finding("network-at-install", "x"),
+             Finding("exfil-endpoint", "x")]
+    assert judge(found).score == 45 + 30
+
+
 def test_critical_findings_make_it_critical():
     verdict = judge([Finding("exfil-endpoint", "discord webhook", critical=True)])
     assert verdict.severity == "critical"

