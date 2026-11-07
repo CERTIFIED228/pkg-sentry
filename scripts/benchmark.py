@@ -7,7 +7,7 @@ Malware comes from Datadog's malicious-software-packages-dataset. Samples
 are encrypted zips (password "infected") and are only ever read into
 memory. Nothing is extracted to disk and nothing is run.
 
-The popular packages folder is made by scripts/fetch_popular.py.
+The popular-packages folder is made by scripts/fetch_popular.py.
 
 Only the static layers are measured: the code and the name. The
 known-malware lookup is left out, since OSV lists most of these samples and
