@@ -1,6 +1,7 @@
 """Patterns that mean the same thing in any language: where data is sent,
 which files are worth stealing, and how malware hides or sticks around."""
 
+import bisect
 import ipaddress
 import re
 
@@ -56,26 +57,27 @@ POWERSHELL_HIDING = re.compile(
 POWERSHELL_IEX = re.compile(r"\biex\b", re.IGNORECASE)
 
 PIPE_TO_SHELL = re.compile(
-    r"(?:curl|wget)\b[^\n|;]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b"
-    r"|(?:curl|wget)\b[^\n;]*(?:-o|-O|>)\s*[^\s;]+[;&\s]+(?:chmod\s+\+?[0-7x]+|\./|sh |bash )"
-    r"|\b(?:iwr|irm|invoke-webrequest|invoke-restmethod)\b[^\n|]*\|\s*iex\b"
-    r"|certutil[^\n]*-urlcache|bitsadmin[^\n]*/transfer|mshta\s+https?:",
+    r"(?:curl|wget)\b[^\n|;]{0,400}\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b"
+    r"|(?:curl|wget)\b[^\n;]{0,400}?(?:-o|-O|>)\s{0,8}[^\s;]{1,300}[;&\s]{1,8}"
+    r"(?:chmod\s+\+?[0-7x]+|\./|sh |bash )"
+    r"|\b(?:iwr|irm|invoke-webrequest|invoke-restmethod)\b[^\n|]{0,400}\|\s*iex\b"
+    r"|certutil[^\n]{0,200}-urlcache|bitsadmin[^\n]{0,200}/transfer|mshta\s+https?:",
     re.IGNORECASE,
 )
 
 DECODE_TO_SHELL = re.compile(
-    r"base64\s+(?:-d|--decode|-D)\b[^\n]*\|\s*(?:ba|z|da)?sh\b"
-    r"|frombase64string\([^\n]*\)\s*\|\s*iex",
+    r"base64\s+(?:-d|--decode|-D)\b[^\n|]{0,200}\|\s*(?:ba|z|da)?sh\b"
+    r"|frombase64string\([^\n]{0,2000}?\)\s*\|\s*iex",
     re.IGNORECASE,
 )
-SELF_UNINSTALL = re.compile(r"\bpip3?\s+(?:-{1,2}[\w-]+\s+)*uninstall\b", re.IGNORECASE)
+SELF_UNINSTALL = re.compile(r"\bpip3?\s+(?:-\S+\s+){0,8}uninstall\b", re.IGNORECASE)
 
 PERSISTENCE = re.compile(
     r"Start Menu[/\\\\]+Programs[/\\\\]+Startup|CurrentVersion[/\\\\]+Run(?:Once)?\b"
     r"|schtasks(?:\.exe)?\s+/create|\bcrontab\s+-|Library/LaunchAgents"
     r"|systemctl\s+--user\s+enable|\bat\.exe\b"
-    r"|>>\s*['\"]?(?:~|\$HOME)?/?\.(?:bashrc|zshrc|bash_profile|profile)\b"
-    r"|\.(?:bashrc|zshrc|bash_profile)['\"]\)?\s*,\s*['\"]a",
+    r"|>>\s{0,8}['\"]?(?:~|\$HOME)?/?\.(?:bashrc|zshrc|bash_profile|profile)\b"
+    r"|\.(?:bashrc|zshrc|bash_profile)['\"]\)?\s{0,8},\s{0,8}['\"]a",
     re.IGNORECASE,
 )
 
@@ -112,14 +114,36 @@ GATES = {
 }
 
 
+# One rule firing thousands of times in a file says nothing new, and a file
+# built to do that would slow the scan down.
+PER_RULE = 20
+
+
+def line_finder(text: str):
+    """offset -> line number, without recounting newlines for every match."""
+    starts: list[int] = []
+
+    def line_of(pos: int) -> int:
+        if not starts:
+            starts.append(0)
+            starts.extend(m.end() for m in re.finditer("\n", text))
+        return bisect.bisect_right(starts, pos)
+
+    return line_of
+
+
 def check_text(text: str, path: str, line_of=None, install_time: bool = False) -> list[Finding]:
     """String-level checks. `line_of(offset)` maps a match back to a line."""
-    line_of = line_of or (lambda pos: text.count("\n", 0, pos) + 1)
+    line_of = line_of or line_finder(text)
     lower = text.lower()
     gate = {name: any(word in lower for word in words) for name, words in GATES.items()}
     found = []
+    counts: dict[str, int] = {}
 
     def add(rule, message, match, critical=False, points=None):
+        counts[rule] = counts.get(rule, 0) + 1
+        if counts[rule] > PER_RULE:
+            return
         start = max(0, match.start() - 30)
         found.append(Finding(rule, message, path, line_of(match.start()),
                              snippet(text[start: match.end() + 30]), critical, points))
@@ -127,6 +151,7 @@ def check_text(text: str, path: str, line_of=None, install_time: bool = False) -
     # At runtime these also turn up in honest code (install instructions in an
     # error message, a tool that drives PowerShell), so they count for less.
     weaker = None if install_time else 15
+    weaker_powershell = None if install_time else 20
 
     if gate["exfil"]:
         for m in EXFIL.finditer(text):
@@ -148,7 +173,7 @@ def check_text(text: str, path: str, line_of=None, install_time: bool = False) -
         for m in POWERSHELL.finditer(text):
             if hiding or POWERSHELL_IEX.search(text, m.start(), m.start() + 300):
                 add("hidden-powershell", "starts PowerShell hidden or with encoded commands", m,
-                    critical=install_time, points=weaker and 20)
+                    critical=install_time, points=weaker_powershell)
     if gate["pipe"]:
         for m in PIPE_TO_SHELL.finditer(text):
             add("download-exec", "downloads a script or program and runs it", m,
