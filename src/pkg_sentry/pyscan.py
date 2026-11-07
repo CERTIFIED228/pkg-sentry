@@ -1,17 +1,22 @@
 """Static checks for Python files.
 
 The file is parsed with `ast`, never imported or run. Import aliases are
-followed (`import base64 as b`, `__import__("base64")`) so renaming a module
-doesn't hide a call. Files that don't parse (Python 2, or broken on purpose)
-still get the text checks.
+followed (`import base64 as b`, `__import__("base64")`, `_s = os.system`)
+so renaming things doesn't hide a call, and the tree is walked with an
+explicit stack, so code nested thousands of levels deep can't crash the scan.
+Files that don't parse (Python 2, or broken on purpose) still get the text
+checks.
 """
 
 import ast
+import codecs
+import io
 import re
+import tokenize
 import warnings
 
 from .rules import Finding, snippet
-from .textrules import check_text
+from .textrules import check_text, line_finder
 
 EXEC = {"exec", "eval", "compile", "builtins.exec", "builtins.eval", "builtins.compile"}
 DECODE_PREFIXES = ("base64.", "zlib.decompress", "gzip.decompress", "bz2.decompress",
@@ -47,64 +52,101 @@ OBFUSCATOR = re.compile(
 )
 # Names obfuscators generate: IlIlIlIl, OO0O0O0O, _0x1f2a, __________1
 SCRAMBLED_NAME = re.compile(r"^(?:[Il]{6,}|[O0]{6,}|_0x[0-9a-f]{3,}|_{4,}\d*)$")
-SCRAMBLED_WORD = re.compile(r"\b(?:[Il]{6,}|O[O0]{5,}|_0x[0-9a-f]{3,})\b")
-# Cheap first pass: a file with none of these can't trigger any AST rule, so
-# the parse is skipped. Most files in a big library land here.
-WORTH_PARSING = re.compile(
-    r"\b(?:exec|eval|compile|subprocess|system|popen|startfile|spawn|socket|urllib|urlopen|requests"
-    r"|httpx|http\.client|aiohttp|smtplib|ftplib|websocket|pycurl|wget|telebot|discord_webhook"
-    r"|__import__|import_module|environ|getuser|gethostname|getlogin|getnode|uname|setup|pty"
-    r"|chr|dns)\b"
-)
 EXEC_WORDS = re.compile(r"\b(?:exec|eval|compile)\b")
 SHELL_WORDS = re.compile(r"\b(?:system|popen|subprocess|Popen|call|run|spawn\w*|startfile)\b")
 RECON_WORDS = re.compile(r"\b(?:gethostname|getuser|getlogin|node|uname|getnode)\b")
 BLOB = re.compile(r"^[A-Za-z0-9+/=\s]{2000,}$|^[0-9a-fA-F\s]{2000,}$")
+# Source encodings real projects use. Anything else in a coding line (utf-7,
+# unicode_escape...) lets code read as harmless text but run as something else.
+NORMAL_ENCODINGS = {"utf-8", "utf-8-sig", "ascii", "latin-1", "iso8859-1", "iso8859-15",
+                    "iso8859-2", "cp1250", "cp1251", "cp1252", "koi8-r", "euc_jp", "shift_jis",
+                    "cp932", "gbk", "gb2312", "gb18030", "big5", "euc_kr", "cp949", "mac-roman"}
 
 
-def scan_python(path: str, source: str, role: str = "runtime") -> list[Finding]:
+def decode_source(data: bytes | str) -> tuple[str, str]:
+    """Text of a Python file as Python itself would read it, and its encoding."""
+    if isinstance(data, str):
+        return data, "utf-8"
+    try:
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(data).readline)
+        encoding = codecs.lookup(encoding).name
+    except (SyntaxError, LookupError):
+        encoding = "utf-8"
+    try:
+        return data.decode(encoding, errors="replace"), encoding
+    except (LookupError, UnicodeError):
+        return data.decode("utf-8", errors="replace"), "utf-8"
+
+
+def parse(source: str) -> ast.Module | None:
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+
+
+def scan_python(path: str, data: bytes | str, role: str = "runtime") -> list[Finding]:
     """role: "setup" (everything runs at install), "import" (module-level
     code runs when imported) or "runtime"."""
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            tree = ast.parse(source)
-    except (SyntaxError, ValueError, RecursionError, MemoryError):
-        return _scan_unparsable(path, source, role)
+    source, encoding = decode_source(data)
+    found = []
+    if encoding not in NORMAL_ENCODINGS:
+        found.append(Finding("obfuscated", f"declares the unusual source encoding {encoding}, "
+                             "which hides code from anything reading it as plain text", path, 1,
+                             snippet(source.split("\n", 2)[0]), critical=role == "setup"))
+    tree = parse(source)
+    if tree is None:
+        return found + _scan_unparsable(path, source, role)
     visitor = _Visitor(path, source, role)
-    visitor.called_at_import = _called_at_import(tree)
     try:
-        visitor.visit(tree)
+        visitor.prepare(tree)
+        visitor.walk(tree)
     except RecursionError:
-        # Absurdly deep code. Don't let it crash the scan (that alone would be
-        # a way to hide a payload); fall back to the text checks.
-        return _scan_unparsable(path, source, role)
-    return visitor.finish()
+        if role != "runtime":
+            found.append(Finding("obfuscated", "is nested too deeply to analyse", path, None,
+                                 None, points=25))
+        return found + _scan_unparsable(path, source, role)
+    return found + visitor.finish()
 
 
-def local_imports(source: str) -> set[str]:
-    """Top-level module names a setup.py imports (from main import run -> "main")."""
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            tree = ast.parse(source)
-    except (SyntaxError, ValueError, RecursionError, MemoryError):
+def imports_of(data: bytes | str) -> set[tuple[int, str]]:
+    """(level, dotted name) for every import: `from . import x` is (1, "x")."""
+    tree = parse(decode_source(data)[0])
+    if tree is None:
         return set()
-    names = set()
+    found = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            names |= {a.name.split(".")[0] for a in node.names}
-        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
-            names.add(node.module.split(".")[0])
-    return names
+            found |= {(0, a.name) for a in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            found.add((node.level, base))
+            found |= {(node.level, f"{base}.{a.name}".strip(".")) for a in node.names}
+    return found
 
 
-class _Visitor(ast.NodeVisitor):
+def file_references(data: bytes | str) -> set[str]:
+    """String literals that look like relative file paths (scripts/build.sh)."""
+    tree = parse(decode_source(data)[0])
+    if tree is None:
+        return set()
+    return {n.value.strip().removeprefix("./") for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+            and 0 < len(n.value) < 200 and "\n" not in n.value
+            and re.fullmatch(r"\.?/?[\w.-]+(?:/[\w.-]+)*\.\w{1,5}", n.value.strip())}
+
+
+class _Visitor:
     def __init__(self, path, source, role):
         self.path, self.source, self.role = path, source, role
         self.aliases: dict[str, str] = {}
         self.decoded_names: set[str] = set()
         self.network_names: set[str] = set()
+        self.recon_names: set[str] = set()
+        self.decode_funcs: set[str] = set()
+        self.called_at_import: set[str] = set()
         self.depth = 0
         self.findings: list[Finding] = []
         self.calls: list[tuple[str, ast.Call, bool]] = []
@@ -113,64 +155,94 @@ class _Visitor(ast.NodeVisitor):
         # Decoded/downloaded variables only matter if something execs them.
         self.track_values = bool(EXEC_WORDS.search(source) or SHELL_WORDS.search(source))
         self.track_recon = bool(RECON_WORDS.search(source))
-        self.recon_names: set[str] = set()
-        self.called_at_import: set[str] = set()
-
-    # -- bookkeeping ---------------------------------------------------------
 
     @property
     def install_time(self) -> bool:
         return self.role == "setup" or (self.role == "import" and self.depth == 0)
 
-    def visit_FunctionDef(self, node):
-        # A function the module itself calls at the top level runs on import too.
-        runs_now = self.depth == 0 and getattr(node, "name", None) in self.called_at_import
-        self.depth += 0 if runs_now else 1
-        self.generic_visit(node)
-        self.depth -= 0 if runs_now else 1
+    def prepare(self, tree: ast.Module) -> None:
+        """First pass: imports, functions that return decoded data, and which
+        local functions the module calls from its top level."""
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                self._note_import(node)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                returns = [node.body] if isinstance(node, ast.Lambda) else [
+                    n.value for n in ast.walk(node) if isinstance(n, ast.Return) and n.value]
+                if any(self._contains(r, self._is_decode) for r in returns):
+                    if isinstance(node, ast.Lambda):
+                        continue
+                    self.decode_funcs.add(node.name)
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Lambda):
+                if self._contains(node.value.body, self._is_decode):
+                    self.decode_funcs.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        for stmt in tree.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(stmt, ast.If) and _is_main_guard(stmt.test):
+                continue
+            for node in ast.walk(stmt):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    self.called_at_import.add(node.func.id)
 
-    visit_AsyncFunctionDef = visit_Lambda = visit_FunctionDef
+    def walk(self, tree: ast.Module) -> None:
+        # (node, depth) pairs on an explicit stack instead of recursion.
+        stack = [(tree, 0)]
+        while stack:
+            node, depth = stack.pop()
+            self.depth = depth
+            self._handle(node)
+            stack.extend(reversed(list(self._children(node, depth))))
 
-    def visit_ClassDef(self, node):
-        # Class bodies run at import, so they don't count as nesting.
-        self.generic_visit(node)
+    def _children(self, node, depth):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # A function the module itself calls at the top level runs on import too.
+            runs_now = depth == 0 and node.name in self.called_at_import
+            for child in ast.iter_child_nodes(node):
+                yield child, depth if runs_now else depth + 1
+        elif isinstance(node, ast.Lambda):
+            for child in ast.iter_child_nodes(node):
+                yield child, depth + 1
+        elif isinstance(node, ast.If) and _is_main_guard(node.test):
+            # `if __name__ == "__main__":` only runs when the file is run directly.
+            yield node.test, depth
+            for child in node.body:
+                yield child, depth + 1
+            for child in node.orelse:
+                yield child, depth
+        else:
+            for child in ast.iter_child_nodes(node):
+                yield child, depth
 
-    def visit_If(self, node):
-        # `if __name__ == "__main__":` only runs when the file is run directly.
-        test = node.test
-        is_main = any(isinstance(n, ast.Compare) and isinstance(n.left, ast.Name)
-                      and n.left.id == "__name__"
-                      and any(_const(c) == "__main__" for c in n.comparators)
-                      for n in ast.walk(test))
-        if not is_main:
-            return self.generic_visit(node)
-        self.visit(test)
-        self.depth += 1
-        for child in node.body:
-            self.visit(child)
-        self.depth -= 1
-        for child in node.orelse:
-            self.visit(child)
+    def _handle(self, node) -> None:
+        if isinstance(node, ast.Call):
+            self._visit_call(node)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr, ast.AugAssign)):
+            self._visit_assign(node)
+        elif isinstance(node, ast.Name):
+            if SCRAMBLED_NAME.match(node.id):
+                self.scrambled.add(node.id)
+        elif isinstance(node, ast.Constant):
+            if isinstance(node.value, str) and len(node.value) >= 2000 and BLOB.match(node.value):
+                self.add("obfuscated", "carries a large encoded blob", node, points=10)
 
-    def visit_Name(self, node):
-        if SCRAMBLED_NAME.match(node.id):
-            self.scrambled.add(node.id)
-
-    def visit_Import(self, node):
-        for alias in node.names:
-            self.aliases[alias.asname or alias.name.split(".")[0]] = (
-                alias.name if alias.asname else alias.name.split(".")[0]
-            )
-
-    def visit_ImportFrom(self, node):
-        if node.module and not node.level:
+    def _note_import(self, node) -> None:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                self.aliases[alias.asname or alias.name.split(".")[0]] = (
+                    alias.name if alias.asname else alias.name.split(".")[0]
+                )
+        elif node.module and not node.level:
             for alias in node.names:
                 self.aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
 
-    def visit_Assign(self, node):
-        self.generic_visit(node)
+    def _visit_assign(self, node) -> None:
         value = node.value
-        targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        if value is None:
+            return
+        raw_targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        targets = [n.id for t in raw_targets for n in ast.walk(t) if isinstance(n, ast.Name)]
         if not targets or isinstance(value, ast.Constant):
             return
         if isinstance(value, (ast.Name, ast.Attribute)):
@@ -178,6 +250,8 @@ class _Visitor(ast.NodeVisitor):
             name = self.name_of(value)
             if name and _dangerous(name):
                 self.aliases.update({t: name for t in targets})
+            if isinstance(value, ast.Name) and value.id in self.decoded_names:
+                self.decoded_names.update(targets)
             return
         if self.track_recon and self._contains(value, self._is_recon):
             self.recon_names.update(targets)
@@ -191,7 +265,7 @@ class _Visitor(ast.NodeVisitor):
             if module:
                 self.aliases.update({t: module for t in targets})
 
-    def visit_Call(self, node):
+    def _visit_call(self, node) -> None:
         name = self.name_of(node.func)
         if name:
             self.calls.append((name, node, self.install_time))
@@ -204,12 +278,6 @@ class _Visitor(ast.NodeVisitor):
                 self.add("obfuscated", "hides which module it imports", node)
         if name == "setup" or (name or "").endswith(".setup"):
             self._check_setup(node)
-        self.generic_visit(node)
-
-    def visit_Constant(self, node):
-        if isinstance(node.value, str) and len(node.value) >= 2000:
-            if BLOB.match(node.value):
-                self.add("obfuscated", "carries a large encoded blob", node, points=10)
 
     # -- names ---------------------------------------------------------------
 
@@ -240,15 +308,19 @@ class _Visitor(ast.NodeVisitor):
     def _is_decode(self, node) -> bool:
         if isinstance(node, ast.Name):
             return node.id in self.decoded_names
+        if isinstance(node, ast.Subscript) and _reversed_slice(node.slice):
+            return True  # "...)1(tnirp"[::-1]
         if not isinstance(node, ast.Call):
             return False
-        name = self.name_of(node.func) or ""
+        func = node.func
+        if isinstance(func, ast.Name) and func.id in self.decode_funcs:
+            return True
+        name = self.name_of(func) or ""
         if name.startswith(DECODE_PREFIXES):
             return True
-        if isinstance(node.func, ast.Attribute) and node.func.attr in DECODE_METHODS:
+        if isinstance(func, ast.Attribute) and func.attr in DECODE_METHODS:
             return True
         # ''.join(chr(x) for x in [...]) and bytes([...]).decode()
-        func = node.func
         if isinstance(func, ast.Attribute) and func.attr == "join":
             return any(isinstance(n, ast.Call) and self.name_of(n.func) == "chr"
                        for n in ast.walk(node))
@@ -361,7 +433,7 @@ class _Visitor(ast.NodeVisitor):
         m = OBFUSCATOR.search(self.source)
         if m:
             self.findings.append(Finding("obfuscated", "deliberately scrambled code",
-                                         self.path, self.source.count("\n", 0, m.start()) + 1,
+                                         self.path, line_finder(self.source)(m.start()),
                                          snippet(m.group(0))))
         elif len(self.scrambled) >= 5:
             names = ", ".join(sorted(self.scrambled)[:3])
@@ -370,6 +442,29 @@ class _Visitor(ast.NodeVisitor):
 
         self.findings += check_text(self.source, self.path, install_time=self.role == "setup")
         return self.findings
+
+
+def _is_main_guard(test) -> bool:
+    """Exactly `__name__ == "__main__"` (either way round), possibly with `and`.
+    `!=` or `or` would run on import, so they don't count."""
+    if isinstance(test, ast.BoolOp):
+        return isinstance(test.op, ast.And) and any(_is_main_guard(v) for v in test.values)
+    if not (isinstance(test, ast.Compare) and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)):
+        return False
+    sides = [test.left, test.comparators[0]]
+    has_name = any(isinstance(s, ast.Name) and s.id == "__name__" for s in sides)
+    return has_name and any(_const(s) == "__main__" for s in sides)
+
+
+def _reversed_slice(node) -> bool:
+    if not isinstance(node, ast.Slice) or node.step is None:
+        return False
+    step = node.step
+    if isinstance(step, ast.UnaryOp) and isinstance(step.op, ast.USub):
+        step = step.operand
+        return isinstance(step, ast.Constant) and step.value == 1
+    return isinstance(step, ast.Constant) and step.value == -1
 
 
 def _const(node) -> str | None:
@@ -411,20 +506,6 @@ def _dangerous(name: str) -> bool:
             or name.startswith(NETWORK_PREFIXES) or name.startswith(DECODE_PREFIXES))
 
 
-def _called_at_import(tree: ast.Module) -> set[str]:
-    """Names of functions called by the module's own top-level code."""
-    called = set()
-    for stmt in tree.body:
-        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            continue
-        if isinstance(stmt, ast.If) and "__main__" in ast.dump(stmt.test):
-            continue
-        for node in ast.walk(stmt):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                called.add(node.func.id)
-    return called
-
-
 def _const_command(node) -> bool:
     if isinstance(node, (ast.List, ast.Tuple)):
         return bool(node.elts) and all(_const(e) is not None for e in node.elts)
@@ -436,30 +517,18 @@ def _const_arg(call: ast.Call) -> str | None:
 
 
 def _reads_a_file(node) -> bool:
-    """exec(open("pkg/version.py").read()) is a normal way to get a version."""
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-        if node.func.attr in ("read", "read_text", "read_bytes"):
-            return True
-    return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "open"
-               for n in ast.walk(node))
-
-
-def _text_only(path, source, role) -> list[Finding]:
-    found = check_text(source, path, install_time=role == "setup")
-    m = OBFUSCATOR.search(source)
-    scrambled = set(SCRAMBLED_WORD.findall(source))
-    if m:
-        found.append(Finding("obfuscated", "deliberately scrambled code", path,
-                             source.count("\n", 0, m.start()) + 1, snippet(m.group(0))))
-    elif len(scrambled) >= 5:
-        names = ", ".join(sorted(scrambled)[:3])
-        found.append(Finding("obfuscated", f"deliberately scrambled names ({names}...)", path))
-    return found
+    """exec(open("pkg/version.py").read()) is a normal way to get a version.
+    The file it reads is scanned in its own right (see analyse.py)."""
+    return any(isinstance(n, ast.Call) and (
+        (isinstance(n.func, ast.Name) and n.func.id == "open")
+        or (isinstance(n.func, ast.Attribute) and n.func.attr in ("read", "read_text")))
+        for n in ast.walk(node))
 
 
 def _scan_unparsable(path, source, role) -> list[Finding]:
     found = check_text(source, path, install_time=role == "setup")
-    if re.search(r"\b(?:exec|eval)\s*\([^\n]*(?:b64decode|decompress|fromhex|decrypt)", source):
+    hidden = r"\b(?:exec|eval)\s*\([^\n]{0,300}?(?:b64decode|decompress|fromhex|decrypt)"
+    if re.search(hidden, source):
         found.append(Finding("exec-decoded", "decodes hidden code and runs it", path,
                              critical=role == "setup"))
     return found

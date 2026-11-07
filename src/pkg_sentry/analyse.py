@@ -4,18 +4,20 @@ The main job here is deciding *when* each file's code runs, because code
 that runs by itself during `pip install`/`npm install` is far more
 dangerous than the same code in a function nobody calls:
 
-- setup.py, and local modules it imports, run during install
-- __init__.py runs on import (module-level code only)
+- setup.py runs during install, and so does everything it imports, runs or
+  reads as code (followed from file to file), and an in-tree build backend
+- module-level code in a package runs on import
 - .pth files run every time Python starts
-- npm install hooks and the files they start run during install
+- npm install hooks run during install, and so does every file they load
 """
 
+import ast
 import posixpath
 import re
 
 from .archive import Unpacked
-from .jsscan import scan_js, scan_package_json
-from .pyscan import local_imports, scan_python
+from .jsscan import local_requires, scan_gyp, scan_js, scan_package_json
+from .pyscan import file_references, imports_of, scan_python
 from .rules import Finding, snippet
 from .textrules import binary_kind, check_text
 
@@ -25,51 +27,64 @@ TEXT_EXTENSIONS = {".py", ".js", ".cjs", ".mjs", ".ts", ".json", ".txt", ".md", 
 DROPPED_PROGRAMS = {".exe", ".scr", ".msi"}
 SCRIPTS = {".sh", ".bash", ".bat", ".cmd", ".ps1", ".vbs"}
 JS = {".js", ".cjs", ".mjs"}
-DEV_DIRS = {"example", "examples", "docs", "doc", "scripts", "benchmarks", "benchmark", "bench",
-            "tools", "samples", "demo", "demos", "ci", ".github", ".circleci", "fixtures",
-            "__fixtures__", "__tests__", "__mocks__", "e2e", "dev", "winbuild", ".evergreen"}
-# Files in the other ecosystem's language don't run on install or import:
-# JavaScript in a PyPI package is a web asset, Python in an npm package a helper.
-OWN_CODE = {"pypi": {".py", ".pth"}, "npm": {".js", ".cjs", ".mjs"}}
-FOREIGN_CODE = {".py", ".js", ".cjs", ".mjs"}
+CODE = {".py", ".pyw", ".pth", ".pyc", ".sh", ".bat", ".cmd", ".ps1", ".gyp", ".json"} | JS
+DEV_DIRS = {"test", "tests", "testing", "example", "examples", "docs", "doc", "scripts",
+            "benchmarks", "benchmark", "bench", "tools", "samples", "demo", "demos", "ci",
+            ".github", ".circleci", "fixtures", "__fixtures__", "__tests__", "__mocks__", "e2e",
+            "dev", "winbuild", ".evergreen"}
 DEV_FILES = re.compile(r"^(?:test_.*\.py|conftest\.py|.*_tests?\.py|.*\.(?:test|spec)\.[cm]?js"
                        r"|make\.bat|gulpfile\.js|gruntfile\.js|karma\.conf\.js)$", re.IGNORECASE)
 # Code in tests, docs and build tooling doesn't run when someone installs or
 # uses the package, so only signs that are never innocent count there.
 STRONG = {"exfil-endpoint", "disguised-binary", "pth-file", "archive-escape"}
-PTH_CODE = re.compile(r"^\s*import\s", re.MULTILINE)
-PTH_DANGER = re.compile(r"b64decode|base64|zlib|marshal|subprocess|os\.system|popen|urllib|urlopen"
-                        r"|socket|requests|http\.client|codecs\.decode|fromhex")
+# Files in the other ecosystem's language don't run on install or import:
+# JavaScript in a PyPI package is a web asset, Python in an npm package a helper.
+OWN_CODE = {"pypi": {".py", ".pth"}, "npm": {".js", ".cjs", ".mjs"}}
+FOREIGN_CODE = {".py", ".js", ".cjs", ".mjs"}
+PTH_DANGER = re.compile(
+    r"b64decode|base64|zlib|marshal|subprocess|os\.system|popen|os\.spawn|os\.exec|execl|execv"
+    r"|urllib|urlopen|socket|requests|http\.client|codecs\.decode|fromhex|chr\(|getattr\(\s*os"
+    r"|open\("
+)
+PTH_PLAIN_IMPORT = re.compile(r"^\s*import\s+[\w.]+\s*$")
+PTH_MODULES = {"sys", "types", "os", "importlib"}
+PTH_IMPORTS = {"importlib", "importlib.util", "importlib.machinery", "_distutils_hack"}
+PTH_CALLS = {"os.path.join", "os.path.dirname", "os.path.exists", "sys._getframe",
+             "sys.modules.setdefault", "importlib.util.module_from_spec",
+             "importlib.machinery.PathFinder.find_spec", "types.ModuleType", "os.environ.get",
+             "m.__dict__.setdefault", "mp.append"}
 SENDS_DATA = {"exfil-endpoint", "raw-ip-url", "network-at-install", "env-dump", "recon",
               "download-exec", "fetch-and-run"}
+FOLLOW_LIMIT = 300
 
 
 def analyse(unpacked: Unpacked, ecosystem: str | None = None) -> list[Finding]:
     files = {f.path: f for f in unpacked.files}
-    ecosystem = ecosystem or _guess_ecosystem(files)
+    ecosystem = ecosystem or guess_ecosystem(files)
     findings = [Finding("archive-escape", f"has a file that {why}", path)
                 for path, why in unpacked.suspicious]
+    findings += _unread(unpacked)
 
-    install_files = set()
+    packages = {posixpath.dirname(p) for p in files if posixpath.basename(p) == "__init__.py"}
+    install_files: set[str] = set()
+    setup_files: set[str] = set()
     if ecosystem == "npm":
-        root = _root_package_json(files)
+        root = root_package_json(files)
         if root:
             found, run_files = scan_package_json(root, files[root].text())
             findings += found
             base = posixpath.dirname(root)
-            install_files = {posixpath.join(base, f) for f in run_files}
-    packages = {posixpath.dirname(p) for p in files if posixpath.basename(p) == "__init__.py"}
-    # Local modules that setup.py imports run during install too.
-    setup_dirs: dict[str, set[str]] = {}
-    for path, f in files.items():
-        if posixpath.basename(path) == "setup.py":
-            setup_dirs[posixpath.dirname(path)] = local_imports(f.text())
+            install_files = _follow_requires(
+                {posixpath.normpath(posixpath.join(base, f)) for f in run_files}, files)
+    else:
+        setup_files = _setup_files(files)
 
     for path, f in files.items():
         ext = posixpath.splitext(path)[1].lower()
+        install = path in install_files or path in setup_files
         foreign = ext in FOREIGN_CODE and ext not in OWN_CODE.get(ecosystem, FOREIGN_CODE)
-        dev = (is_dev_file(path) or foreign) and path not in install_files
-        found = _check_file(path, f, setup_dirs, install_files, packages, dev)
+        dev = not install and (foreign or is_dev_file(path, packages))
+        found = _check_file(path, f, ecosystem, setup_files, install_files, packages, dev)
         if dev:
             found = [x for x in found if x.rule in STRONG]
         findings += found
@@ -78,7 +93,7 @@ def analyse(unpacked: Unpacked, ecosystem: str | None = None) -> list[Finding]:
     return _without_duplicates(findings)
 
 
-def _check_file(path, f, setup_dirs, install_files, packages, dev) -> list[Finding]:
+def _check_file(path, f, ecosystem, setup_files, install_files, packages, dev) -> list[Finding]:
     name = posixpath.basename(path)
     ext = posixpath.splitext(name)[1].lower()
     kind = binary_kind(f.data[:72])
@@ -88,45 +103,226 @@ def _check_file(path, f, setup_dirs, install_files, packages, dev) -> list[Findi
     found = []
     if ext in DROPPED_PROGRAMS:
         found.append(Finding("binary-payload", f"ships {name}", path))
-    if ext == ".py":
-        role = "runtime" if dev else _python_role(path, setup_dirs, packages)
-        found += scan_python(path, f.text(), role)
+    if path in setup_files and ext not in (".py", ".pyc") and ext not in JS:
+        # Something setup.py reads as code or runs, whatever its extension.
+        found += scan_python(path, f.data, "setup")
+        found += check_text(f.text(), path, install_time=True)
+    elif ext == ".py":
+        role = "runtime" if dev else _python_role(path, setup_files, packages)
+        found += scan_python(path, f.data, role)
+    elif ext == ".pyc":
+        loaded = path in setup_files
+        found.append(Finding("compiled-python",
+                             "setup.py loads compiled Python that can't be read" if loaded
+                             else "ships compiled Python (.pyc) that can't be read",
+                             path, points=45 if loaded else None))
     elif ext == ".pth":
         found += _check_pth(path, f.text())
     elif ext in JS:
-        found += scan_js(path, f.text(), install_time=path in install_files)
+        found += scan_js(path, f.text(), install_time=path in install_files or path in setup_files)
     elif ext in SCRIPTS:
-        found += check_text(f.text(), path)
+        found += check_text(f.text(), path, install_time=path in install_files)
+    elif name == "binding.gyp" and ecosystem == "npm":
+        found += scan_gyp(path, f.text())
     return found
 
 
-def is_dev_file(path: str) -> bool:
-    folders = [p.lower() for p in path.split("/")[:-1]]
-    if any(p in DEV_DIRS or p.startswith("test") or p.endswith("tests") for p in folders):
-        return True
+def guess_ecosystem(files) -> str:
+    python = any(p in ("setup.py", "PKG-INFO", "pyproject.toml") for p in files) or any(
+        p.split("/", 1)[0].endswith(".dist-info") for p in files)
+    return "npm" if "package.json" in files and not python else "pypi"
+
+
+def root_package_json(files) -> str | None:
+    if "package.json" in files:
+        return "package.json"
+    candidates = [p for p in files if posixpath.basename(p) == "package.json"
+                  and "node_modules/" not in p]
+    return min(candidates, key=lambda p: (p.count("/"), p), default=None)
+
+
+def is_dev_file(path: str, packages=frozenset()) -> bool:
+    folders = path.split("/")[:-1]
+    for i, folder in enumerate(folders):
+        lower = folder.lower()
+        named_dev = lower in DEV_DIRS or lower.endswith("tests")
+        # A top-level package called tools/ or testinfra/ is the library itself.
+        here = "/".join(folders[: i + 1])
+        top_package = here in packages and (i == 0 or folders[:i] == ["src"])
+        if named_dev and not top_package:
+            return True
     return bool(DEV_FILES.match(posixpath.basename(path)))
 
 
-def _python_role(path: str, setup_dirs: dict[str, set[str]], packages: set[str]) -> str:
+def _python_role(path: str, setup_files: set[str], packages: set[str]) -> str:
     folder, name = posixpath.split(path)
-    stem = name[:-3]
-    if name == "setup.py" or stem in setup_dirs.get(folder, ()):
+    if path in setup_files:
         return "setup"
     # Module-level code runs when the module is imported. That needs a name
     # Python can import (not run-bench.py) inside a package, or at the top.
-    importable = folder in packages or folder in ("", "src") or folder in setup_dirs
-    return "import" if stem.isidentifier() and importable else "runtime"
+    importable = folder in packages or folder in ("", "src")
+    return "import" if name[:-3].isidentifier() and importable else "runtime"
+
+
+def _setup_files(files) -> set[str]:
+    """setup.py, and everything it pulls in, followed from file to file."""
+    start = [p for p in files if posixpath.basename(p) == "setup.py"] + _build_backend(files)
+    roots = {posixpath.dirname(p) for p in start} | {""}
+    seen: set[str] = set()
+    queue = list(start)
+    while queue and len(seen) < FOLLOW_LIMIT:
+        path = queue.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        if not path.endswith(".py"):
+            continue  # only follow imports and paths out of Python
+        data, base = files[path].data, posixpath.dirname(path)
+        for level, dotted in imports_of(data):
+            queue += _module_files(dotted, level, base, roots | {base}, files)
+        for ref in file_references(data):
+            for candidate in (posixpath.normpath(posixpath.join(base, ref)), ref):
+                if candidate in files:
+                    queue.append(candidate)
+    return seen
+
+
+def _module_files(dotted: str, level: int, base: str, roots: set[str], files) -> list[str]:
+    if level:
+        anchor = base
+        for _ in range(level - 1):
+            anchor = posixpath.dirname(anchor)
+        roots = {anchor}
+    parts = [p for p in dotted.split(".") if p]
+    found = []
+    for root in roots:
+        for i in range(len(parts) + 1):
+            stem = posixpath.join(root, *parts[:i]) if i else root
+            for candidate in (f"{stem}.py", f"{stem}.pyc", f"{stem}/__init__.py"):
+                candidate = candidate.lstrip("/")
+                if i and candidate in files or (not i and level and candidate.endswith(
+                        "__init__.py") and candidate in files):
+                    found.append(candidate)
+    return found
+
+
+def _build_backend(files) -> list[str]:
+    """In-tree build backends and cmdclass modules named in pyproject.toml."""
+    root = next((p for p in files if posixpath.basename(p) == "pyproject.toml"
+                 and p.count("/") <= 1), None)
+    if not root:
+        return []
+    text = files[root].text()
+    base = posixpath.dirname(root)
+    dirs = {base}
+    for group in re.findall(r"backend-path\s*=\s*\[([^\]]{0,500})\]", text):
+        dirs |= {posixpath.normpath(posixpath.join(base, d)).lstrip("./")
+                 for d in re.findall(r"['\"]([^'\"]{1,200})['\"]", group)}
+    modules = re.findall(r"build-backend\s*=\s*['\"]([\w.]+)", text)
+    cmdclass = re.search(r"\[tool\.setuptools\.cmdclass\]([^\[]{0,2000})", text)
+    if cmdclass:
+        modules += [m.rsplit(".", 1)[0] for m in re.findall(r"=\s*['\"]([\w.]+)['\"]",
+                                                              cmdclass.group(1))]
+    found = []
+    for module in modules:
+        found += _module_files(module, 0, base, dirs, files)
+    return found
+
+
+def _follow_requires(start: set[str], files) -> set[str]:
+    """npm install files and everything they require, followed through."""
+    seen: set[str] = set()
+    queue = [p for p in start if p in files]
+    while queue and len(seen) < FOLLOW_LIMIT:
+        path = queue.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        base = posixpath.dirname(path)
+        for spec in local_requires(files[path].text()):
+            target = posixpath.normpath(posixpath.join(base, spec)).lstrip("/")
+            for candidate in (target, f"{target}.js", f"{target}.cjs", f"{target}.mjs",
+                              f"{target}/index.js"):
+                if candidate in files:
+                    queue.append(candidate)
+    return seen
 
 
 def _check_pth(path: str, text: str) -> list[Finding]:
     # site.py runs any line in a .pth file that starts with "import".
-    lines = [line for line in text.splitlines() if PTH_CODE.match(line)]
-    risky = [line for line in lines if PTH_DANGER.search(line)]
-    if not risky:
-        return []
-    line_no = text.splitlines().index(risky[0]) + 1
-    return [Finding("pth-file", "has a .pth file that runs code every time Python starts",
-                    path, line_no, snippet(risky[0]), critical=True)]
+    found = []
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.lstrip().startswith("import") or PTH_PLAIN_IMPORT.match(line):
+            continue
+        if _known_pth(line):
+            continue
+        if PTH_DANGER.search(line):
+            found.append(Finding("pth-file", "has a .pth file that runs code every time Python "
+                                 "starts", path, number, snippet(line), critical=True))
+        else:
+            found.append(Finding("pth-code", "has a .pth file that runs a line of code every time "
+                                 "Python starts", path, number, snippet(line)))
+    return found + check_text(text, path, install_time=True)
+
+
+def _known_pth(line: str) -> bool:
+    """The two kinds of .pth line that honest packages ship: setuptools'
+    namespace-package loader and its distutils shim. Only calls from those
+    templates are allowed, so tacking anything else on still gets noticed."""
+    try:
+        tree = ast.parse(line.strip())
+    except (SyntaxError, ValueError):
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if _dotted(func) == "__import__":
+                arg = node.args[0] if len(node.args) == 1 and not node.keywords else None
+                if not (isinstance(arg, ast.Constant) and arg.value in PTH_IMPORTS):
+                    return False
+            elif not (_dotted(func) in PTH_CALLS or isinstance(func, ast.Attribute)
+                      and func.attr == "add_shim" and _shim_import(func.value)):
+                return False
+        elif isinstance(node, ast.Import):
+            if any(alias.name not in PTH_MODULES or alias.asname for alias in node.names):
+                return False
+        elif isinstance(node, (ast.ImportFrom, ast.Lambda, ast.FunctionDef, ast.ClassDef)):
+            return False
+    return True
+
+
+def _dotted(node) -> str | None:
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        return ".".join([node.id, *reversed(parts)])
+    return None
+
+
+def _shim_import(node) -> bool:
+    return (isinstance(node, ast.Call) and _dotted(node.func) == "__import__"
+            and len(node.args) == 1 and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "_distutils_hack")
+
+
+def _unread(unpacked: Unpacked) -> list[Finding]:
+    """Code that couldn't be read can't be called clean."""
+    found = []
+    for path, why in unpacked.skipped:
+        name = posixpath.basename(path)
+        ext = posixpath.splitext(path)[1].lower()
+        if path != "*" and ext not in CODE and name not in ("setup.py", "package.json"):
+            continue
+        if why in ("symlink", "hard link"):
+            continue
+        key = name in ("setup.py", "package.json") or ext == ".pth"
+        where = "part of the package" if path == "*" else path
+        found.append(Finding("unread-code", f"couldn't read {where} ({why}), so it could be "
+                             "hiding anything", None if path == "*" else path,
+                             points=60 if key else None))
+    return found
 
 
 def _combine(findings: list[Finding]) -> list[Finding]:
@@ -157,15 +353,3 @@ def _without_duplicates(findings: list[Finding]) -> list[Finding]:
             seen.add(key)
             unique.append(f)
     return unique
-
-
-def _root_package_json(files) -> str | None:
-    candidates = [p for p in files if posixpath.basename(p) == "package.json"
-                  and "node_modules/" not in p]
-    return min(candidates, key=lambda p: p.count("/"), default=None)
-
-
-def _guess_ecosystem(files) -> str:
-    if _root_package_json(files):
-        return "npm"
-    return "pypi"

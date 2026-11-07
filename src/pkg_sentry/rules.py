@@ -36,6 +36,9 @@ RULES = {
     "obfuscated": (25, "deliberately scrambled code"),
     "persistence": (25, "sets itself up to run again later"),
     "hides-traces": (25, "covers its tracks"),
+    "unread-code": (40, "parts of the package couldn't be read"),
+    "compiled-python": (20, "ships compiled Python that can't be read"),
+    "pth-code": (15, "runs a line of code every time Python starts"),
     "self-publish": (35, "publishes packages by itself, like spam or a worm"),
     "shell": (5, "runs shell commands"),
     # archive
@@ -49,7 +52,7 @@ RULES = {
 # evidence, something that's hard to explain innocently.
 BEHAVIOUR = {"install-script", "install-hook", "shell-at-install", "network-at-install", "shell",
              "exec-dynamic", "binary-payload", "credentials", "very-new", "new", "no-source",
-             "revived", "fetch-and-run"}
+             "revived", "fetch-and-run", "pth-code"}
 BEHAVIOUR_CAP = 45
 
 THRESHOLDS = (("high", 60), ("medium", 35), ("low", 15))
