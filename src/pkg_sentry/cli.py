@@ -5,13 +5,13 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import __version__
-from .analyse import analyse
+from .analyse import analyse, guess_ecosystem, looks_like_python
 from .archive import ArchiveError, File, Limits, Unpacked, clean_path, unpack
 from .check import Checker, Report
 from .known import OSV
 from .names import load_popular
 from .projects import ProjectError, read_project
-from .report import as_json, as_text, summary
+from .report import as_json, as_text, clean, summary
 from .rules import SEVERITIES, Finding, judge
 from .spec import PackageSpec, SpecError, parse_spec
 
@@ -51,6 +51,8 @@ def _parser() -> argparse.ArgumentParser:
                        help="skip the known-malware lookup on OSV.dev")
         p.add_argument("--no-code", action="store_true",
                        help="don't download and read the code, metadata only")
+        p.add_argument("--max-download", type=int, default=100, metavar="MB",
+                       help="biggest file to download and read (default: 100)")
 
     check = sub.add_parser("check", help="check one or more packages",
                            description="Check packages, e.g. `requests`, `requests==2.31.0`, "
@@ -99,11 +101,11 @@ def run_scan(args) -> int:
     except ProjectError as e:
         _error(str(e))
         return 2
-    if not specs:
-        _error(f"no packages found in {args.file}")
-        return 2
     for note in notes:
-        print(f"note: {note}", file=sys.stderr)
+        print(f"note: {clean(note)}", file=sys.stderr)
+    if not specs:
+        _error(f"no packages from a public registry found in {args.file}")
+        return 2
     checker = _checker(args)
     print(f"checking {len(specs)} package(s) from {args.file}...", file=sys.stderr)
     with ThreadPoolExecutor(max(1, args.workers)) as pool:
@@ -113,16 +115,24 @@ def run_scan(args) -> int:
 
 def run_inspect(args) -> int:
     path = args.path
+    ecosystem = "npm" if args.npm else "pypi" if args.pypi else None
     try:
-        unpacked = _read_folder(path) if path.is_dir() else unpack(path.read_bytes())
+        if path.is_dir():
+            unpacked = _read_folder(path).strip_top_dir()
+        else:
+            data = path.read_bytes()
+            unpacked = unpack(data).strip_top_dir()
+            if not data.startswith(b"PK"):  # a tar, so it could be an npm tarball
+                as_npm = unpack(data, npm=True)  # the way npm itself would unpack it
+                npm = ecosystem == "npm" or not ecosystem and not looks_like_python(
+                    _index(unpacked)) and guess_ecosystem(_index(as_npm)) == "npm"
+                if npm:
+                    unpacked, ecosystem = as_npm, "npm"
     except (OSError, ArchiveError) as e:
         _error(f"can't read {path}: {e}")
         return 2
-    unpacked.strip_top_dir()
-    ecosystem = "npm" if args.npm else "pypi" if args.pypi else None
+    ecosystem = ecosystem or guess_ecosystem(_index(unpacked))
     findings = analyse(unpacked, ecosystem)
-    ecosystem = ecosystem or ("npm" if any(f.path == "package.json" for f in unpacked.files)
-                              else "pypi")
     name = _guess_name(path)
     if name and (squat := load_popular(ecosystem).squats(name)):
         findings.append(Finding("typosquat", f"the name looks like {squat.how}"))
@@ -132,17 +142,20 @@ def run_inspect(args) -> int:
 
 
 def _checker(args) -> Checker:
-    return Checker(osv=None if args.offline else OSV(), read_code=not args.no_code)
+    return Checker(osv=None if args.offline else OSV(), read_code=not args.no_code,
+                   max_download=max(1, args.max_download) * 1_000_000)
 
 
 def _finish(reports: list[Report], args, show_clean: bool) -> int:
-    failed = any(r.error for r in reports)
+    # 2 means "couldn't tell": a package that wasn't fully read isn't a pass.
+    failed = any(r.error or r.incomplete for r in reports)
     flagged = [r for r in reports if not r.error and r.verdict.at_least(args.fail_on)]
     if args.json:
         print(as_json(reports))
     else:
         colour = not args.no_colour and sys.stdout.isatty() and "NO_COLOR" not in os.environ
-        shown = [r for r in reports if show_clean or r.error or r.verdict.severity != "none"]
+        shown = [r for r in reports
+                 if show_clean or r.error or r.incomplete or r.verdict.severity != "none"]
         for r in shown:
             print(as_text(r, colour=colour))
             print()
@@ -160,7 +173,12 @@ def _read_folder(root: Path) -> Unpacked:
             continue
         if path.is_symlink() or not path.is_file():
             continue
-        rel = clean_path(path.relative_to(root).as_posix())
+        # On disk the file is already inside the folder, so a backslash in its
+        # name is just a character (it's only a separator inside archives).
+        rel = clean_path(path.relative_to(root).as_posix().replace("\\", "_"))
+        if not rel:
+            result.skipped.append((path.name, "odd file name"))
+            continue
         size = path.stat().st_size
         if size > limits.max_file_bytes:
             result.skipped.append((rel, f"{size:,} bytes, too big to scan"))
@@ -171,6 +189,10 @@ def _read_folder(root: Path) -> Unpacked:
             break
         result.files.append(File(rel, path.read_bytes()))
     return result
+
+
+def _index(unpacked: Unpacked) -> dict:
+    return {f.path: f for f in unpacked.files}
 
 
 def _guess_name(path: Path) -> str | None:
@@ -189,7 +211,7 @@ def _guess_name(path: Path) -> str | None:
 
 
 def _error(message: str) -> None:
-    print(f"pkg-sentry: {message}", file=sys.stderr)
+    print(f"pkg-sentry: {clean(message)}", file=sys.stderr)
 
 
 def _safe_streams() -> None:

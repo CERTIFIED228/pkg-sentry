@@ -1,10 +1,11 @@
 """Check one package end to end: known malware, name, metadata, code."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import http
 from .analyse import analyse
 from .archive import ArchiveError, Unpacked, unpack
+from .jsscan import scan_hooks
 from .known import OSV
 from .metadata import metadata_findings
 from .names import load_popular
@@ -19,6 +20,8 @@ class Report:
     verdict: Verdict
     info: PackageInfo | None = None
     error: str | None = None
+    # Why some of the code couldn't be read, so a clean verdict isn't the whole story.
+    incomplete: list[str] = field(default_factory=list)
 
     @property
     def label(self) -> str:
@@ -29,7 +32,7 @@ class Report:
 
 class Checker:
     def __init__(self, registry: Registry | None = None, osv: OSV | None = None,
-                 read_code: bool = True, max_download: int = 50_000_000):
+                 read_code: bool = True, max_download: int = 100_000_000):
         self.registry = registry or Registry()
         self.osv = osv  # None = offline, skip the lookup
         self.read_code = read_code
@@ -38,6 +41,7 @@ class Checker:
     def check(self, spec: PackageSpec) -> Report:
         findings: list[Finding] = []
         notes: list[str] = []
+        incomplete: list[str] = []
 
         info = None
         try:
@@ -65,16 +69,18 @@ class Checker:
             return Report(spec, judge(findings, notes))
 
         findings += metadata_findings(info)
+        if info.deprecated:
+            notes.append(f"the registry marks this release as deprecated or yanked: "
+                         f"{info.deprecated}")
 
         if not self.read_code:
             notes.append("code wasn't read (--no-code)")
-            if info.install_scripts:
-                findings += [Finding("install-script", f"runs '{cmd}' on install")
-                             for cmd in info.install_scripts.values()]
+            # npm publishes the scripts with the metadata, so hooks can still be checked.
+            findings += scan_hooks("package.json", info.scripts)[0]
         else:
-            findings += self._read_code(info, notes)
+            findings += self._read_code(info, notes, incomplete)
 
-        return Report(spec, judge(findings, notes), info=info)
+        return Report(spec, judge(findings, notes), info=info, incomplete=incomplete)
 
     def _known(self, spec, version, notes) -> list[Finding]:
         if self.osv is None:
@@ -92,20 +98,34 @@ class Checker:
         return [Finding("known-malware", f"{vuln_id}: {summary}".rstrip(": "), critical=True)
                 for vuln_id, summary in advisories.malware]
 
-    def _read_code(self, info: PackageInfo, notes: list[str]) -> list[Finding]:
+    def _read_code(self, info: PackageInfo, notes: list[str],
+                   incomplete: list[str]) -> list[Finding]:
         if not info.artifacts:
             notes.append("no files to download for this release")
             return []
         findings = []
+        too_big = (f"is over the {self.max_download // 1_000_000} MB download limit, so its code "
+                   "wasn't read")
         for artifact in info.artifacts:
             if artifact.size and artifact.size > self.max_download:
-                notes.append(f"{artifact.filename} is {artifact.size:,} bytes, too big to read")
+                incomplete.append(f"{artifact.filename} {too_big}")
                 continue
             try:
                 data = self.registry.download(artifact, self.max_download)
-                unpacked = unpack(data).strip_top_dir()
-            except (http.FetchError, ArchiveError) as e:
-                notes.append(f"couldn't read {artifact.filename}: {e}")
+            except http.TooBig:
+                incomplete.append(f"{artifact.filename} {too_big}")
+                continue
+            except http.FetchError as e:
+                incomplete.append(f"couldn't download {artifact.filename}: {e}")
+                continue
+            try:
+                # npm drops the first folder of every entry, whatever it's called.
+                unpacked = (unpack(data, npm=True) if info.ecosystem == "npm"
+                            else unpack(data).strip_top_dir())
+            except ArchiveError as e:
+                # pip and npm read archives this couldn't, so it isn't safe to call it clean.
+                findings.append(Finding("unread-code", f"couldn't unpack it ({e}), so it could "
+                                        "be hiding anything", artifact.filename))
                 continue
             notes += _skipped_notes(artifact.filename, unpacked)
             findings += [_in(artifact.filename, f) for f in analyse(unpacked, info.ecosystem)]

