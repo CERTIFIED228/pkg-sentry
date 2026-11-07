@@ -18,16 +18,22 @@ on:
 jobs:
   pkg-sentry:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install git+https://github.com/CERTIFIED228/pkg-sentry.git
+      # Pin a release tag or commit so the check can't change under you.
+      - run: pip install git+https://github.com/CERTIFIED228/pkg-sentry.git@v0.1.0
       # Use whichever files your project has. Exit code 1 fails the check.
       - run: pkg-sentry scan requirements.txt
       - run: pkg-sentry scan package-lock.json
 ```
+
+Exit code 2 means a package couldn't be fully checked (too big to download,
+or the registry was down). It fails the step too, because an unchecked
+package isn't a passed one.
 
 `--fail-on medium` makes it stricter. `--json > report.json` gives a file you
 can upload as a build artifact.
