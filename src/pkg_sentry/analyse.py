@@ -109,7 +109,7 @@ def _check_file(path, f, ecosystem, setup_files, install_files, packages, dev) -
         found += check_text(f.text(), path, install_time=True)
     elif ext == ".py":
         role = "runtime" if dev else _python_role(path, setup_files, packages)
-        found += scan_python(path, f.data, role)
+        found += scan_python(path, f.data, role, during_install=path in setup_files)
     elif ext == ".pyc":
         loaded = path in setup_files
         found.append(Finding("compiled-python",

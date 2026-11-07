@@ -442,10 +442,17 @@ try:
 except ImportError:
     pass
 '''
-    found = [(f.rule, f.line, f.critical) for f in scan_python("pkg/m.py", code, "import")
+    found = [(f.rule, f.line, f.critical) for f in scan_python("pkg/m.py", code, "import",
+                                                             during_install=True)
              if f.rule == "download-exec"]
     assert ("download-exec", 3, True) in found
     assert ("download-exec", 6, False) in found
+
+
+def test_a_url_in_a_library_module_isnt_install_time():
+    code = "API = 'https://api.telegram.org/bot'\ndef send(t, m):\n    post(API + t, m)\n"
+    found = scan_python("tqdm/contrib/telegram.py", code, "import")
+    assert not any(f.critical for f in found)
 
 
 def test_decoding_into_an_attribute_doesnt_taint_self():

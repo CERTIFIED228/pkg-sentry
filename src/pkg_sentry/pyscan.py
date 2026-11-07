@@ -87,9 +87,11 @@ def parse(source: str) -> ast.Module | None:
         return None
 
 
-def scan_python(path: str, data: bytes | str, role: str = "runtime") -> list[Finding]:
+def scan_python(path: str, data: bytes | str, role: str = "runtime",
+                during_install: bool = False) -> list[Finding]:
     """role: "setup" (everything runs at install), "import" (module-level
-    code runs when imported) or "runtime"."""
+    code runs when imported) or "runtime". during_install: an "import"
+    module that setup.py imports, so its top level runs during pip install."""
     source, encoding = decode_source(data)
     found = []
     if encoding not in NORMAL_ENCODINGS:
@@ -101,6 +103,7 @@ def scan_python(path: str, data: bytes | str, role: str = "runtime") -> list[Fin
         return found + _scan_unparsable(path, source, role)
     visitor = _Visitor(path, source, role)
     visitor.tree = tree
+    visitor.during_install = during_install
     try:
         visitor.prepare(tree)
         visitor.walk(tree)
@@ -286,6 +289,7 @@ class _Visitor:
         self.env_dumps: list[ast.AST] = []
         self.scrambled: set[str] = set()
         self.tree: ast.Module | None = None
+        self.during_install = False
         # Decoded/downloaded variables only matter if something execs them.
         self.track_values = bool(EXEC_WORDS.search(source) or SHELL_WORDS.search(source))
         self.track_recon = bool(RECON_WORDS.search(source))
@@ -582,11 +586,11 @@ class _Visitor:
 
     def _text_checks(self) -> list[Finding]:
         found = check_text(self.source, self.path, install_time=self.role == "setup")
-        if self.role != "import" or not found or self.tree is None:
+        if not (self.during_install and self.role == "import" and found and self.tree):
             return found
-        # A module's top level runs on import (during install, if setup.py
-        # imports it), so hits there count as install time. The text checks
-        # work line by line, so they're run again and matched up by line.
+        # setup.py imports this module, so its top level runs during install
+        # and hits there count as install time. The text checks work line by
+        # line, so they're run again and matched up by line.
         top = _top_level_lines(self.tree)
         strong = check_text(self.source, self.path, install_time=True)
         return ([f for f in found if f.line not in top]
