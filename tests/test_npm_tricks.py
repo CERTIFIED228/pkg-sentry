@@ -102,3 +102,13 @@ def test_binding_gyp_commands():
     found = scan_gyp("binding.gyp", gyp)
     assert [f.rule for f in found if f.rule == "shell-at-install"] == ["shell-at-install"]
     assert any(f.rule == "download-exec" and f.critical for f in found)
+
+
+@pytest.mark.parametrize(
+    "hook, script",
+    [("sh scripts/install.sh", "scripts/install.sh"), ("bash -e ./setup.sh", "setup.sh"),
+     ("./bin/post", "bin/post"), ("python build.py", "build.py")],
+)
+def test_scripts_a_hook_runs_count_as_install_time(hook, script):
+    _, files = scan_package_json("package.json", pkg({"postinstall": hook}))
+    assert script in files

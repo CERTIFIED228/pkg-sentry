@@ -179,6 +179,22 @@ def node_files(command: str) -> set[str]:
     return {_candidate for f in found if f for _candidate in _with_extensions(f)}
 
 
+def script_files(command: str) -> set[str]:
+    """Scripts a hook runs some other way: `sh scripts/install.sh`,
+    `./setup.sh`, `python build.py`."""
+    tokens = [t.strip("'\"") for t in re.findall(r"'[^']*'|\"[^\"]*\"|\S+", command)]
+    if not tokens:
+        return set()
+    program = tokens[0].rsplit("/", 1)[-1]
+    if program in ("sh", "bash", "zsh", "dash", "python", "python3", "pwsh", "powershell"):
+        target = next((t for t in tokens[1:] if not t.startswith("-")), "")
+    elif tokens[0].startswith("./") or program.endswith((".sh", ".py", ".ps1", ".cmd", ".bat")):
+        target = tokens[0]
+    else:
+        return set()
+    return {target.removeprefix("./")} if target else set()
+
+
 def local_requires(source: str) -> set[str]:
     """Relative module specifiers a file loads: ./x, ../lib/y."""
     found = set()
@@ -211,7 +227,7 @@ def scan_hooks(path: str, scripts: dict, text: str = "") -> tuple[list[Finding],
         findings.append(Finding("install-script", f"runs '{command}' on install", path, line,
                                 snippet(command)))
         for leaf in leaves:
-            run_files |= node_files(leaf)
+            run_files |= node_files(leaf) | script_files(leaf)
             if HOOK_SHELL.search(leaf):
                 findings.append(Finding("shell-at-install",
                                         "the install script runs shell commands",

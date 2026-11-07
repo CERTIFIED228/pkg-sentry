@@ -74,6 +74,11 @@ def analyse(unpacked: Unpacked, ecosystem: str | None = None) -> list[Finding]:
     # A wheel's top level is what lands in site-packages, so a package there
     # called tools/ is the library. In an sdist it's the project's tooling.
     wheel = any(p.split("/", 1)[0].endswith(".dist-info") for p in files)
+    if wheel:
+        # Folders without __init__.py are still importable (namespace packages).
+        packages |= {folder for p in files if p.endswith(".py")
+                     for folder in _parents(posixpath.dirname(p))
+                     if all(part.isidentifier() for part in folder.split("/"))}
     installed = packages if wheel else frozenset()
     install_files: set[str] = set()
     setup_files: dict[str, str] = {}
@@ -120,7 +125,8 @@ def _check_file(path, f, ecosystem, setup_files, install_files, packages, dev) -
         found += scan_python(path, f.data, "setup")
         found += check_text(f.text(), path, install_time=True)
     elif ext == ".py":
-        role = "runtime" if dev else _python_role(path, setup_files, packages)
+        role = ("setup" if path in install_files else "runtime" if dev
+                else _python_role(path, setup_files, packages))
         folder = posixpath.dirname(path)
         startup = name in STARTUP_MODULES and (folder in ("", "src") or SITE_ROOT.search(folder))
         if startup:
@@ -137,7 +143,7 @@ def _check_file(path, f, ecosystem, setup_files, install_files, packages, dev) -
         found += _check_pth(path, f.text())
     elif ext in JS:
         found += scan_js(path, f.text(), install_time=path in install_files or path in setup_files)
-    elif ext in SCRIPTS:
+    elif ext in SCRIPTS or path in install_files:
         found += check_text(f.text(), path, install_time=path in install_files)
     elif name == "binding.gyp" and ecosystem == "npm":
         found += scan_gyp(path, f.text())
@@ -172,6 +178,11 @@ def is_dev_file(path: str, packages=frozenset()) -> bool:
         if named_dev and not top_package:
             return True
     return bool(DEV_FILES.match(posixpath.basename(path)))
+
+
+def _parents(folder: str) -> list[str]:
+    parts = folder.split("/") if folder else []
+    return ["/".join(parts[: i + 1]) for i in range(len(parts))]
 
 
 def _python_role(path: str, setup_files: dict[str, str], packages: set[str]) -> str:

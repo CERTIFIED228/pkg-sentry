@@ -16,7 +16,7 @@ import tokenize
 import warnings
 
 from .rules import Finding, snippet
-from .textrules import check_text, line_finder
+from .textrules import PIPE_TO_SHELL, check_text, line_finder
 
 EXEC = {"exec", "eval", "compile", "builtins.exec", "builtins.eval", "builtins.compile"}
 DECODE_PREFIXES = ("base64.", "zlib.decompress", "gzip.decompress", "bz2.decompress",
@@ -530,6 +530,10 @@ class _Visitor:
             else:
                 self.add("shell", "runs shell commands", node)
             strings = [_const(n) or "" for a in args for n in ast.walk(a)]
+            if PIPE_TO_SHELL.search(" ".join(strings)):
+                # os.system("curl ... | sh") in code that runs, not just in a docstring
+                self.add("download-exec", "downloads a script and runs it", node,
+                         critical=self.install_time)
             if name == "os.startfile" or any(RUNNABLE.search(text) for text in strings):
                 self.calls.append(("runs-a-program", node, self.install_time))
 
