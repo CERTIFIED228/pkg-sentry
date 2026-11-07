@@ -55,6 +55,8 @@ WORTH_PARSING = re.compile(
     r"|chr|dns)\b"
 )
 EXEC_WORDS = re.compile(r"\b(?:exec|eval|compile)\b")
+SHELL_WORDS = re.compile(r"\b(?:system|popen|subprocess|Popen|call|run|spawn\w*|startfile)\b")
+RECON_WORDS = re.compile(r"\b(?:gethostname|getuser|getlogin|node|uname|getnode)\b")
 BLOB = re.compile(r"^[A-Za-z0-9+/=\s]{2000,}$|^[0-9a-fA-F\s]{2000,}$")
 
 
@@ -68,6 +70,7 @@ def scan_python(path: str, source: str, role: str = "runtime") -> list[Finding]:
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return _scan_unparsable(path, source, role)
     visitor = _Visitor(path, source, role)
+    visitor.called_at_import = _called_at_import(tree)
     try:
         visitor.visit(tree)
     except RecursionError:
@@ -106,7 +109,10 @@ class _Visitor(ast.NodeVisitor):
         self.env_dumps: list[ast.AST] = []
         self.scrambled: set[str] = set()
         # Decoded/downloaded variables only matter if something execs them.
-        self.track_values = bool(EXEC_WORDS.search(source))
+        self.track_values = bool(EXEC_WORDS.search(source) or SHELL_WORDS.search(source))
+        self.track_recon = bool(RECON_WORDS.search(source))
+        self.recon_names: set[str] = set()
+        self.called_at_import: set[str] = set()
 
     # -- bookkeeping ---------------------------------------------------------
 
@@ -115,9 +121,11 @@ class _Visitor(ast.NodeVisitor):
         return self.role == "setup" or (self.role == "import" and self.depth == 0)
 
     def visit_FunctionDef(self, node):
-        self.depth += 1
+        # A function the module itself calls at the top level runs on import too.
+        runs_now = self.depth == 0 and getattr(node, "name", None) in self.called_at_import
+        self.depth += 0 if runs_now else 1
         self.generic_visit(node)
-        self.depth -= 1
+        self.depth -= 0 if runs_now else 1
 
     visit_AsyncFunctionDef = visit_Lambda = visit_FunctionDef
 
@@ -161,8 +169,16 @@ class _Visitor(ast.NodeVisitor):
         self.generic_visit(node)
         value = node.value
         targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
-        if not targets or isinstance(value, (ast.Constant, ast.Name, ast.Attribute)):
+        if not targets or isinstance(value, ast.Constant):
             return
+        if isinstance(value, (ast.Name, ast.Attribute)):
+            # _ssystem = os.system, then _ssystem("...")
+            name = self.name_of(value)
+            if name and _dangerous(name):
+                self.aliases.update({t: name for t in targets})
+            return
+        if self.track_recon and self._contains(value, self._is_recon):
+            self.recon_names.update(targets)
         if self.track_values and self._contains(value, self._is_decode):
             self.decoded_names.update(targets)
         if self.track_values and self._contains(value, self._is_network):
@@ -247,6 +263,11 @@ class _Visitor(ast.NodeVisitor):
         name = self.name_of(node.func) or ""
         return name.startswith(NETWORK_PREFIXES)
 
+    def _is_recon(self, node) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id in self.recon_names
+        return isinstance(node, ast.Call) and self.name_of(node.func) in RECON
+
     def _contains(self, node, test) -> bool:
         return any(test(n) for n in ast.walk(node))
 
@@ -273,6 +294,11 @@ class _Visitor(ast.NodeVisitor):
             elif self.install_time and not _const(payload) and not _reads_a_file(payload):
                 self.add("exec-dynamic", f"runs code built at runtime {when}", node)
 
+        if (name in SHELL or name.startswith(SHELL_PREFIXES)) and self.track_values and any(
+                self._contains(a, self._is_decode) for a in args):
+            self.add("exec-decoded", "decodes a hidden command and runs it", node,
+                     critical=self.install_time)
+
         if name in SHELL or name.startswith(SHELL_PREFIXES):
             if self.install_time and not _build_tool(args):
                 # A command spelled out in the code is clearer evidence than
@@ -288,6 +314,10 @@ class _Visitor(ast.NodeVisitor):
 
         if name.startswith(NETWORK_PREFIXES) and self.install_time:
             self.add("network-at-install", f"connects to the internet {when}", node)
+        if name.startswith(NETWORK_PREFIXES) and self.track_recon and any(
+                self._contains(a, self._is_recon) for a in args):
+            self.add("recon", "sends this computer's name or user name to a server", node,
+                     points=25)
 
         if name in DUMPERS and any(self.name_of(a) == "os.environ" for a in node.args):
             self.env_dumps.append(node)
@@ -363,6 +393,25 @@ def _build_tool(args) -> bool:
     if script.endswith(".sh") and not script.startswith(("/", "http")):
         return True
     return program.rsplit("/", 1)[-1] in BUILD_TOOLS
+
+
+def _dangerous(name: str) -> bool:
+    return (name in EXEC or name in SHELL or name.startswith(SHELL_PREFIXES)
+            or name.startswith(NETWORK_PREFIXES) or name.startswith(DECODE_PREFIXES))
+
+
+def _called_at_import(tree: ast.Module) -> set[str]:
+    """Names of functions called by the module's own top-level code."""
+    called = set()
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(stmt, ast.If) and "__main__" in ast.dump(stmt.test):
+            continue
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                called.add(node.func.id)
+    return called
 
 
 def _const_command(node) -> bool:

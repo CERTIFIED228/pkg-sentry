@@ -61,6 +61,13 @@ PIPE_TO_SHELL = re.compile(
     re.IGNORECASE,
 )
 
+DECODE_TO_SHELL = re.compile(
+    r"base64\s+(?:-d|--decode|-D)\b[^\n]*\|\s*(?:ba|z|da)?sh\b"
+    r"|frombase64string\([^\n]*\)\s*\|\s*iex",
+    re.IGNORECASE,
+)
+SELF_UNINSTALL = re.compile(r"\bpip3?\s+(?:-{1,2}[\w-]+\s+)*uninstall\b", re.IGNORECASE)
+
 PERSISTENCE = re.compile(
     r"Start Menu[/\\\\]+Programs[/\\\\]+Startup|CurrentVersion[/\\\\]+Run(?:Once)?\b"
     r"|schtasks(?:\.exe)?\s+/create|\bcrontab\s+-|Library/LaunchAgents"
@@ -95,6 +102,8 @@ GATES = {
     "powershell": ("powershell", "pwsh"),
     "pipe": ("curl", "wget", "iwr", "irm", "invoke-web", "invoke-rest", "certutil", "bitsadmin",
              "mshta"),
+    "decode": ("base64", "frombase64string"),
+    "uninstall": ("uninstall",),
     "persist": ("startup", "currentversion", "schtasks", "crontab", "launchagents",
                 "systemctl", "at.exe", "bashrc", "zshrc", "bash_profile", ".profile"),
     "ip": ("://",),
@@ -131,15 +140,23 @@ def check_text(text: str, path: str, line_of=None, install_time: bool = False) -
         for m in CREDENTIALS.finditer(text):
             add("credentials", f"reads {m.group(0)}", m)
     if gate["powershell"]:
+        # The command is often built a few lines above the call, so look at the
+        # whole file for the hiding/downloading part.
+        hiding = POWERSHELL_HIDING.search(text)
         for m in POWERSHELL.finditer(text):
-            window = text[m.start(): m.start() + 300]
-            if POWERSHELL_HIDING.search(window):
+            if hiding:
                 add("hidden-powershell", "starts PowerShell hidden or with encoded commands", m,
                     critical=install_time, points=weaker and 20)
     if gate["pipe"]:
         for m in PIPE_TO_SHELL.finditer(text):
             add("download-exec", "downloads a script or program and runs it", m,
                 critical=install_time, points=weaker)
+    if gate["decode"]:
+        for m in DECODE_TO_SHELL.finditer(text):
+            add("exec-decoded", "decodes a hidden command and runs it", m, critical=install_time)
+    if gate["uninstall"] and install_time:
+        for m in SELF_UNINSTALL.finditer(text):
+            add("hides-traces", "uninstalls a package while installing, to cover its tracks", m)
     if gate["persist"]:
         for m in PERSISTENCE.finditer(text):
             add("persistence", "sets itself up to start again later", m)
