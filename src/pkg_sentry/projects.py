@@ -131,7 +131,7 @@ def _poetry(poetry: dict) -> list[PackageSpec]:
     specs = []
     for table in tables:
         for name, wanted in table.items():
-            if name.lower() == "python":
+            if name.lower() == "python" or not REQUIREMENT.fullmatch(name):
                 continue
             if isinstance(wanted, dict):
                 if any(k in wanted for k in ("git", "path", "url")):
@@ -189,6 +189,14 @@ def _package_lock(text: str) -> tuple[list[PackageSpec], list[str]]:
                 notes.append(f"{name}: skipped, comes from {where}")
                 continue
             version = _text(entry.get("version"))
+            if resolved:
+                # What npm installs is the tarball at `resolved`, whatever the
+                # name and version next to it say.
+                real = _tarball_spec(resolved)
+                if real and real != (name, version):
+                    notes.append(f"{name}@{version}: the lockfile downloads "
+                                 f"{real[0]}@{real[1]} instead, so that's what was checked")
+                    name, version = real
             if version and NPM_EXACT.match(version):
                 specs.append(PackageSpec("npm", name, version))
     else:  # v1 nests dependencies
@@ -206,6 +214,22 @@ def _package_lock(text: str) -> tuple[list[PackageSpec], list[str]]:
                 walk(entry.get("dependencies"), depth + 1)
         walk(data.get("dependencies"))
     return _unique(specs), notes
+
+
+def _tarball_spec(url: str) -> tuple[str, str] | None:
+    """https://registry.npmjs.org/@scope/name/-/name-1.2.3.tgz -> ("@scope/name", "1.2.3")."""
+    parts = urlparse(url).path.strip("/").split("/")
+    if "-" not in parts:
+        return None
+    dash = parts.index("-")
+    name = "/".join(parts[:dash])
+    if dash + 2 != len(parts) or not name:
+        return None
+    base = name.rsplit("/", 1)[-1]
+    file = parts[-1]
+    if not (file.startswith(f"{base}-") and file.endswith(".tgz")):
+        return None
+    return name, file[len(base) + 1:-4]
 
 
 def _json(text: str, what: str) -> dict:

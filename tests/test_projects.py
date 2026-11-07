@@ -178,3 +178,21 @@ def test_requirements_saved_with_a_bom(tmp_path):
     path = tmp_path / "requirements.txt"
     path.write_bytes(b"\xef\xbb\xbfrequests==2.31.0\n")
     assert read_project(path)[0] == [PackageSpec("pypi", "requests", "2.31.0")]
+
+
+def test_lockfile_entry_that_downloads_something_else(tmp_path):
+    path = write(tmp_path, "package-lock.json", {"lockfileVersion": 3, "packages": {
+        "node_modules/lodash": {
+            "version": "4.17.21",
+            "resolved": "https://registry.npmjs.org/evil-pkg/-/evil-pkg-1.0.0.tgz"},
+    }})
+    specs, notes = read_project(path)
+    assert specs == [PackageSpec("npm", "evil-pkg", "1.0.0")]
+    assert "downloads evil-pkg@1.0.0 instead" in notes[0]
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="tomllib")
+def test_poetry_skips_names_that_arent_package_names(tmp_path):
+    toml = '[tool.poetry.dependencies]\n"../etc" = "1.0"\nok = "1.0"\n'
+    path = write(tmp_path, "pyproject.toml", toml)
+    assert read_project(path)[0] == [PackageSpec("pypi", "ok", "1.0")]
