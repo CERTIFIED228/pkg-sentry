@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import __version__
-from .analyse import analyse, guess_ecosystem, looks_like_python
+from .analyse import analyse, looks_like_python
 from .archive import ArchiveError, File, Limits, Unpacked, clean_path, unpack
 from .check import Checker, Report
 from .known import OSV
@@ -115,30 +115,43 @@ def run_scan(args) -> int:
 
 def run_inspect(args) -> int:
     path = args.path
-    ecosystem = "npm" if args.npm else "pypi" if args.pypi else None
+    forced = "npm" if args.npm else "pypi" if args.pypi else None
     try:
         if path.is_dir():
-            unpacked = _read_folder(path).strip_top_dir()
+            views = dict.fromkeys(("pypi", "npm"), _read_folder(path).strip_top_dir())
         else:
             data = path.read_bytes()
-            unpacked = unpack(data).strip_top_dir()
-            if not data.startswith(b"PK"):  # a tar, so it could be an npm tarball
-                as_npm = unpack(data, npm=True)  # the way npm itself would unpack it
-                npm = ecosystem == "npm" or not ecosystem and not looks_like_python(
-                    _index(unpacked)) and guess_ecosystem(_index(as_npm)) == "npm"
-                if npm:
-                    unpacked, ecosystem = as_npm, "npm"
+            views = {"pypi": unpack(data).strip_top_dir()}
+            # A tar could be an npm tarball: read it the way npm would unpack it.
+            views["npm"] = views["pypi"] if data.startswith(b"PK") else unpack(data, npm=True)
     except (OSError, ArchiveError) as e:
         _error(f"can't read {path}: {e}")
         return 2
-    ecosystem = ecosystem or guess_ecosystem(_index(unpacked))
-    findings = analyse(unpacked, ecosystem)
+    if forced:
+        choices = [forced]
+    else:
+        # A package could carry both a setup.py and a package.json to steer
+        # the guess, so when it has both it's read both ways.
+        choices = [e for e, present in (
+            ("pypi", looks_like_python(_index(views["pypi"]))),
+            ("npm", "package.json" in _index(views["npm"]))) if present] or ["pypi"]
     name = _guess_name(path)
-    if name and (squat := load_popular(ecosystem).squats(name)):
-        findings.append(Finding("typosquat", f"the name looks like {squat.how}"))
-    notes = [f"skipped {p} ({why})" for p, why in unpacked.skipped[:5]]
-    report = Report(PackageSpec(ecosystem, path.name), judge(findings, notes))
-    return _finish([report], args, show_clean=True)
+    reports = []
+    for ecosystem in choices:
+        unpacked = views[ecosystem]
+        findings = analyse(unpacked, ecosystem)
+        if name and (squat := load_popular(ecosystem).squats(name)):
+            findings.append(Finding("typosquat", f"the name looks like {squat.how}"))
+        notes = [f"skipped {p} ({why})" for p, why in unpacked.skipped[:5]]
+        if len(choices) > 1:
+            notes.append("it looks like both a PyPI and an npm package, so it was read both "
+                         f"ways; this is the {LABELS[ecosystem]} reading, the worse of the two")
+        reports.append(Report(PackageSpec(ecosystem, path.name), judge(findings, notes)))
+    worst = max(reports, key=lambda r: (r.verdict.score, r.spec.ecosystem == "npm"))
+    return _finish([worst], args, show_clean=True)
+
+
+LABELS = {"pypi": "PyPI", "npm": "npm"}
 
 
 def _checker(args) -> Checker:

