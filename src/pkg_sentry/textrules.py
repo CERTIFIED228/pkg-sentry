@@ -48,10 +48,12 @@ CREDENTIALS = re.compile(
 
 POWERSHELL = re.compile(r"powershell|pwsh", re.IGNORECASE)
 POWERSHELL_HIDING = re.compile(
-    r"-w(?:indowstyle)?\s+h(?:idden)?\b|\biex\b|invoke-expression"
+    r"-w(?:indowstyle)?\s+h(?:idden)?\b|invoke-expression"
     r"|downloadstring|downloadfile|invoke-webrequest|frombase64string|-exec(?:utionpolicy)?\s+bypass",
     re.IGNORECASE,
 )
+# "iex" is also Elixir's shell, so it only counts right next to the PowerShell call.
+POWERSHELL_IEX = re.compile(r"\biex\b", re.IGNORECASE)
 
 PIPE_TO_SHELL = re.compile(
     r"(?:curl|wget)\b[^\n|;]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b"
@@ -144,7 +146,7 @@ def check_text(text: str, path: str, line_of=None, install_time: bool = False) -
         # whole file for the hiding/downloading part.
         hiding = POWERSHELL_HIDING.search(text)
         for m in POWERSHELL.finditer(text):
-            if hiding:
+            if hiding or POWERSHELL_IEX.search(text, m.start(), m.start() + 300):
                 add("hidden-powershell", "starts PowerShell hidden or with encoded commands", m,
                     critical=install_time, points=weaker and 20)
     if gate["pipe"]:

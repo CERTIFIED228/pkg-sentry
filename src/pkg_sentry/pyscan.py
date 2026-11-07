@@ -30,6 +30,8 @@ NETWORK_PREFIXES = ("urllib.request.urlopen", "urllib.request.urlretrieve",
                     "pycurl.Curl", "websocket.", "telebot.", "discord_webhook.")
 RECON = {"socket.gethostname", "getpass.getuser", "os.getlogin", "platform.node", "platform.uname",
          "os.uname", "uuid.getnode"}
+LOOKUPS = {"socket.gethostbyname", "socket.getaddrinfo", "socket.gethostbyname_ex",
+           "dns.resolver.resolve", "dns.resolver.query"}
 DUMPERS = {"dict", "str", "repr", "json.dumps", "urllib.parse.urlencode", "list"}
 # Commands people run from setup.py while building, not to attack anyone.
 BUILD_TOOLS = {"git", "cmake", "make", "gcc", "cc", "g++", "clang", "pkg-config", "cython",
@@ -315,7 +317,10 @@ class _Visitor(ast.NodeVisitor):
         if name.startswith(NETWORK_PREFIXES) and self.install_time:
             self.add("network-at-install", f"connects to the internet {when}", node)
         if name.startswith(NETWORK_PREFIXES) and self.track_recon and any(
-                self._contains(a, self._is_recon) for a in args):
+                self._contains(a, self._is_recon) for a in args) and not (
+                name in LOOKUPS and not any(_mixes_text(a) for a in args)):
+            # gethostbyname(gethostname()) just finds this machine's own IP. Sending the
+            # name inside a DNS query (f"{user}.attacker.com") is the beacon.
             self.add("recon", "sends this computer's name or user name to a server", node,
                      points=25)
 
@@ -337,7 +342,7 @@ class _Visitor(ast.NodeVisitor):
 
     def finish(self) -> list[Finding]:
         names = [name for name, _, _ in self.calls]
-        has_network = any(n.startswith(NETWORK_PREFIXES) for n in names)
+        has_network = any(n.startswith(NETWORK_PREFIXES) and n not in LOOKUPS for n in names)
 
         if has_network:
             for name, node, install_time in self.calls:
@@ -393,6 +398,12 @@ def _build_tool(args) -> bool:
     if script.endswith(".sh") and not script.startswith(("/", "http")):
         return True
     return program.rsplit("/", 1)[-1] in BUILD_TOOLS
+
+
+def _mixes_text(node) -> bool:
+    return isinstance(node, (ast.JoinedStr, ast.BinOp)) or (
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr in ("format", "join"))
 
 
 def _dangerous(name: str) -> bool:

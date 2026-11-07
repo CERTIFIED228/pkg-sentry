@@ -163,3 +163,9 @@ def test_binary_kind():
     assert binary_kind(b"\xcf\xfa\xed\xfe....") == "a macOS program"
     assert binary_kind(b"MZ") is None
     assert binary_kind(b"import os") is None
+
+
+def test_elixirs_iex_next_to_a_powershell_lexer_is_fine():
+    text = "'PowerShellLexer': ('pygments.lexers.shell', 'PowerShell'),\n" + "x\n" * 200 + \
+           "'IexLexer': ('pygments.lexers.erlang', 'Elixir iex session')"
+    assert rules(text) == []

