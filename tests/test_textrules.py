@@ -18,11 +18,18 @@ def rules(text, install_time=False):
         "https://webhook.site/0b1c",
         "abc.oast.fun",
         "x.burpcollaborator.net",
-        "https://pastebin.com/raw/Xy12",
     ],
 )
 def test_exfil_endpoints(text):
     assert rules(f"url = '{text}'") == ["exfil-endpoint"]
+
+
+@pytest.mark.parametrize("text", ["https://pastebin.com/raw/Xy12", "https://gofile.io/d/abc",
+                                  "https://transfer.sh/x.zip"])
+def test_file_and_paste_hosts_count_for_less(text):
+    found = check_text(f"url = '{text}'", "x.py")
+    assert [(f.rule, f.value) for f in found] == [("exfil-endpoint", 15)]
+    assert check_text(f"url = '{text}'", "setup.py", install_time=True)[0].critical
 
 
 @pytest.mark.parametrize(

@@ -122,9 +122,9 @@ def scan_js(path: str, source: str, install_time: bool = False) -> list[Finding]
 
     if has_network:
         if has_child and (m := RUNNABLE.search(code)):
-            # Also what esbuild and friends do to fetch their binary, so it's
-            # a weaker sign than the shell one-liners in textrules.
-            add("download-exec", "downloads a program and starts it", m, points=25)
+            # Also how esbuild and friends fetch their binary, so it's behaviour,
+            # not evidence like the shell one-liners in textrules.
+            add("fetch-and-run", "downloads files and starts programs", m)
         if m := ENV_DUMP.search(code):
             add("env-dump", "collects all environment variables and sends them out", m)
         if m := RECON.search(code):

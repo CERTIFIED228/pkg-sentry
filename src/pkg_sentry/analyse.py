@@ -37,7 +37,7 @@ PTH_CODE = re.compile(r"^\s*import\s", re.MULTILINE)
 PTH_DANGER = re.compile(r"b64decode|base64|zlib|marshal|subprocess|os\.system|popen|urllib|urlopen"
                         r"|socket|requests|http\.client|codecs\.decode|fromhex")
 SENDS_DATA = {"exfil-endpoint", "raw-ip-url", "network-at-install", "env-dump", "recon",
-              "download-exec"}
+              "download-exec", "fetch-and-run"}
 
 
 def analyse(unpacked: Unpacked, ecosystem: str | None = None) -> list[Finding]:

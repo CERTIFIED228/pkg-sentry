@@ -6,16 +6,21 @@ import re
 
 from .rules import Finding, snippet
 
-# Services that are handy for receiving stolen data: no account needed,
-# or a bot/webhook token is enough.
+# Services built for receiving data: no account needed, or a bot/webhook
+# token is enough. Malware posts stolen data straight to these.
 EXFIL = re.compile(
     r"discord(?:app)?\.com/api/webhooks/"
     r"|api\.telegram\.org/bot"
     r"|\bngrok(?:-free)?\.(?:io|app|dev)\b"
     r"|\bpipedream\.net\b|\bwebhook\.site\b|\brequestbin\.\w+|\bhookbin\.com\b|\bbeeceptor\.com\b"
-    r"|\binteract\.sh\b|\boast\.(?:pro|live|site|online|fun|me)\b|burpcollaborator\.net|\boastify\.com\b"
-    r"|\bdnslog\.cn\b|\bceye\.io\b|\bcanarytokens\.com\b"
-    r"|\btransfer\.sh\b|\bfile\.io\b|\bgofile\.io\b|\banonfiles\.com\b"
+    r"|\binteract\.sh\b|\boast\.(?:pro|live|site|online|fun|me)\b|burpcollaborator\.net"
+    r"|\boastify\.com\b|\bdnslog\.cn\b|\bceye\.io\b|\bcanarytokens\.com\b",
+    re.IGNORECASE,
+)
+# Anonymous file and paste hosts. Stealers upload archives here, but download
+# tools and docs mention them too, so they count for less.
+DROPS = re.compile(
+    r"\btransfer\.sh\b|\bfile\.io\b|\bgofile\.io\b|\banonfiles\.com\b"
     r"|pastebin\.com/raw|\bpaste\.ee/r/|\brentry\.co\b",
     re.IGNORECASE,
 )
@@ -116,6 +121,9 @@ def check_text(text: str, path: str, line_of=None, install_time: bool = False) -
         for m in EXFIL.finditer(text):
             add("exfil-endpoint", f"sends data to {m.group(0).split('/')[0]}", m,
                 critical=install_time)
+        for m in DROPS.finditer(text):
+            add("exfil-endpoint", f"uploads to {m.group(0).split('/')[0]}", m,
+                critical=install_time, points=weaker)
     if gate["loot"]:
         for m in STOLEN_GOODS.finditer(text):
             add("secrets", f"reads {m.group(0)}", m)

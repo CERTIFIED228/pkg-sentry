@@ -23,6 +23,7 @@ RULES = {
     # code
     "exec-decoded": (40, "decodes hidden code and runs it"),
     "download-exec": (40, "downloads something and runs it"),
+    "fetch-and-run": (25, "downloads files and starts programs"),
     "exec-dynamic": (15, "runs code built at runtime"),
     "hidden-powershell": (35, "starts hidden or encoded PowerShell"),
     "steals-secrets": (35, "reads credentials and has a way to send them out"),
@@ -47,7 +48,7 @@ RULES = {
 # evidence, something that's hard to explain innocently.
 BEHAVIOUR = {"install-script", "install-hook", "shell-at-install", "network-at-install", "shell",
              "exec-dynamic", "binary-payload", "credentials", "very-new", "new", "no-source",
-             "revived"}
+             "revived", "fetch-and-run"}
 BEHAVIOUR_CAP = 45
 
 THRESHOLDS = (("high", 60), ("medium", 35), ("low", 15))

