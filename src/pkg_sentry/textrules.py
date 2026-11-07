@@ -20,15 +20,23 @@ EXFIL = re.compile(
     re.IGNORECASE,
 )
 
-SECRET_PATHS = re.compile(
-    r"\.ssh[/\\\\]+(?:id_|authorized_keys|known_hosts)"
-    r"|\.aws[/\\\\]+credentials|\.azure[/\\\\]|\.config[/\\\\]+gcloud"
-    r"|\.docker[/\\\\]+config\.json|\.kube[/\\\\]+config|\.git-credentials|\.npmrc\b|\.pypirc\b"
-    r"|\bLogin Data\b|\bLocal State\b|\bWeb Data\b|Cookies['\"/\\\\]"
-    r"|discord(?:canary|ptb)?[/\\\\]+Local Storage|Local Storage[/\\\\]+leveldb"
-    r"|\bwallet\.dat\b|\bExodus[/\\\\]|\bElectrum[/\\\\]|\bAtomic[/\\\\]+Local Storage"
+SEP = r"[/\\\\]+"
+# Stores no normal library has a reason to open: browsers, chat apps, wallets.
+STOLEN_GOODS = re.compile(
+    r"\bLogin Data\b|\bLocal State\b|\bWeb Data\b|Network" + SEP + r"Cookies\b"
+    r"|User Data" + SEP + r"Default" + SEP + r"Cookies\b|\bcookies\.sqlite\b|\bkey4\.db\b"
+    r"|discord(?:canary|ptb)?" + SEP + r"Local Storage|Local Storage" + SEP + r"leveldb"
+    r"|Telegram Desktop" + SEP + r"tdata|\bwallet\.dat\b|\bExodus" + SEP + r"exodus\.wallet"
+    r"|\bElectrum" + SEP + r"wallets|\bAtomic" + SEP + r"Local Storage"
     r"|nkbihfbeogaeaoehlefnkodbefgpgknn"  # MetaMask's extension id
-    r"|/etc/shadow\b|\bkeychain-db\b|login\.keychain",
+    r"|/etc/shadow\b|login\.keychain|keychain-db",
+    re.IGNORECASE,
+)
+# Credentials that plenty of honest tools read (the AWS SDK reads ~/.aws).
+CREDENTIALS = re.compile(
+    r"\.ssh" + SEP + r"id_(?:rsa|dsa|ecdsa|ed25519)\b|\.git-credentials\b|\.npmrc\b|\.pypirc\b"
+    r"|\.aws" + SEP + r"credentials\b|\.azure" + SEP + r"(?:accessTokens|msal_token_cache)"
+    r"|\.config" + SEP + r"gcloud\b|\.docker" + SEP + r"config\.json\b|\.kube" + SEP + r"config\b",
     re.IGNORECASE,
 )
 
@@ -50,7 +58,9 @@ PIPE_TO_SHELL = re.compile(
 PERSISTENCE = re.compile(
     r"Start Menu[/\\\\]+Programs[/\\\\]+Startup|CurrentVersion[/\\\\]+Run(?:Once)?\b"
     r"|schtasks(?:\.exe)?\s+/create|\bcrontab\s+-|/etc/cron\.|Library/LaunchAgents"
-    r"|systemctl\s+--user\s+enable|\bat\.exe\b|[/\\\\]\.(?:bashrc|zshrc|bash_profile)\b",
+    r"|systemctl\s+--user\s+enable|\bat\.exe\b"
+    r"|>>\s*['\"]?(?:~|\$HOME)?/?\.(?:bashrc|zshrc|bash_profile|profile)\b"
+    r"|\.(?:bashrc|zshrc|bash_profile)['\"]\)?\s*,\s*['\"]a",
     re.IGNORECASE,
 )
 
@@ -78,8 +88,10 @@ def check_text(text: str, path: str, line_of=None, install_time: bool = False) -
     for m in EXFIL.finditer(text):
         add("exfil-endpoint", f"sends data to {m.group(0).split('/')[0]}", m,
             critical=install_time)
-    for m in SECRET_PATHS.finditer(text):
-        add("secrets", f"reads {m.group(0).strip(chr(39) + chr(34))}", m)
+    for m in STOLEN_GOODS.finditer(text):
+        add("secrets", f"reads {m.group(0)}", m)
+    for m in CREDENTIALS.finditer(text):
+        add("credentials", f"reads {m.group(0)}", m)
     for m in POWERSHELL.finditer(text):
         window = text[m.start(): m.start() + 300]
         if POWERSHELL_HIDING.search(window):

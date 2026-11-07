@@ -29,14 +29,26 @@ NETWORK_PREFIXES = ("urllib.request.urlopen", "urllib.request.urlretrieve",
                     "socket.gethostbyname", "socket.getaddrinfo", "wget.download",
                     "pycurl.Curl", "websocket.", "telebot.", "discord_webhook.")
 RECON = {"socket.gethostname", "getpass.getuser", "os.getlogin", "platform.node", "platform.uname",
-         "os.uname", "uuid.getnode", "platform.platform", "os.getcwd"}
+         "os.uname", "uuid.getnode"}
 DUMPERS = {"dict", "str", "repr", "json.dumps", "urllib.parse.urlencode", "list"}
-ENV_METHODS = {"os.environ.items", "os.environ.copy", "os.environ.keys", "os.environ.values"}
+# Commands people run from setup.py while building, not to attack anyone.
+BUILD_TOOLS = {"git", "cmake", "make", "gcc", "cc", "g++", "clang", "pkg-config", "cython",
+               "nvcc", "xcrun", "hipcc", "ninja", "meson", "cargo", "rustc", "swig", "uname",
+               "nproc", "which", "where", "lsb_release", "sw_vers", "python", "python3"}
 RUNNABLE = re.compile(r"\.(?:exe|bat|cmd|ps1|vbs|scr|msi|sh)\b", re.IGNORECASE)
-OBFUSCATOR = re.compile(
-    r"__pyarmor__|pyarmor_runtime|PyObfuscator|BlankOBF|pyobfuscate|"
-    r"\b(?:[Il]{8,}|_{6,}[0-9a-zA-Z]*)\b"
+OBFUSCATOR = re.compile(r"__pyarmor__|pyarmor_runtime|PyObfuscator|BlankOBF|pyobfuscate")
+# Names obfuscators generate: IlIlIlIl, OO0O0O0O, _0x1f2a, __________1
+SCRAMBLED_NAME = re.compile(r"^(?:[Il]{6,}|[O0]{6,}|_0x[0-9a-f]{3,}|_{4,}\d*)$")
+SCRAMBLED_WORD = re.compile(r"\b(?:[Il]{6,}|O[O0]{5,}|_0x[0-9a-f]{3,})\b")
+# Cheap first pass: a file with none of these can't trigger any AST rule, so
+# the parse is skipped. Most files in a big library land here.
+WORTH_PARSING = re.compile(
+    r"\b(?:exec|eval|compile|subprocess|system|popen|startfile|spawn|socket|urllib|urlopen|requests"
+    r"|httpx|http\.client|aiohttp|smtplib|ftplib|websocket|pycurl|wget|telebot|discord_webhook"
+    r"|__import__|import_module|environ|getuser|gethostname|getlogin|getnode|uname|setup|pty"
+    r"|chr|dns)\b"
 )
+EXEC_WORDS = re.compile(r"\b(?:exec|eval|compile)\b")
 BLOB = re.compile(r"^[A-Za-z0-9+/=\s]{2000,}$|^[0-9a-fA-F\s]{2000,}$")
 
 
@@ -86,7 +98,9 @@ class _Visitor(ast.NodeVisitor):
         self.findings: list[Finding] = []
         self.calls: list[tuple[str, ast.Call, bool]] = []
         self.env_dumps: list[ast.AST] = []
-        self.passed_as_env: set[int] = set()
+        self.scrambled: set[str] = set()
+        # Decoded/downloaded variables only matter if something execs them.
+        self.track_values = bool(EXEC_WORDS.search(source))
 
     # -- bookkeeping ---------------------------------------------------------
 
@@ -105,6 +119,26 @@ class _Visitor(ast.NodeVisitor):
         # Class bodies run at import, so they don't count as nesting.
         self.generic_visit(node)
 
+    def visit_If(self, node):
+        # `if __name__ == "__main__":` only runs when the file is run directly.
+        test = node.test
+        is_main = (isinstance(test, ast.Compare) and isinstance(test.left, ast.Name)
+                   and test.left.id == "__name__"
+                   and any(_const(c) == "__main__" for c in test.comparators))
+        if not is_main:
+            return self.generic_visit(node)
+        self.visit(test)
+        self.depth += 1
+        for child in node.body:
+            self.visit(child)
+        self.depth -= 1
+        for child in node.orelse:
+            self.visit(child)
+
+    def visit_Name(self, node):
+        if SCRAMBLED_NAME.match(node.id):
+            self.scrambled.add(node.id)
+
     def visit_Import(self, node):
         for alias in node.names:
             self.aliases[alias.asname or alias.name.split(".")[0]] = (
@@ -120,9 +154,11 @@ class _Visitor(ast.NodeVisitor):
         self.generic_visit(node)
         value = node.value
         targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
-        if self._contains(value, self._is_decode):
+        if not targets or isinstance(value, (ast.Constant, ast.Name, ast.Attribute)):
+            return
+        if self.track_values and self._contains(value, self._is_decode):
             self.decoded_names.update(targets)
-        if self._contains(value, self._is_network):
+        if self.track_values and self._contains(value, self._is_network):
             self.network_names.update(targets)
         name = self.name_of(value) if isinstance(value, ast.Call) else None
         if name and name.startswith(("importlib.import_module", "__import__")):
@@ -131,8 +167,6 @@ class _Visitor(ast.NodeVisitor):
                 self.aliases.update({t: module for t in targets})
 
     def visit_Call(self, node):
-        # subprocess.run(..., env=os.environ.copy()) is normal, not a dump.
-        self.passed_as_env.update(id(k.value) for k in node.keywords if k.arg == "env")
         name = self.name_of(node.func)
         if name:
             self.calls.append((name, node, self.install_time))
@@ -233,7 +267,7 @@ class _Visitor(ast.NodeVisitor):
                 self.add("exec-dynamic", f"runs code built at runtime {when}", node)
 
         if name in SHELL or name.startswith(SHELL_PREFIXES):
-            if self.install_time:
+            if self.install_time and not _build_tool(args):
                 self.add("shell-at-install", f"runs commands {when}", node)
             else:
                 self.add("shell", "runs shell commands", node)
@@ -246,7 +280,8 @@ class _Visitor(ast.NodeVisitor):
 
         if name in DUMPERS and any(self.name_of(a) == "os.environ" for a in node.args):
             self.env_dumps.append(node)
-        elif name in ENV_METHODS and id(node) not in self.passed_as_env:
+        elif name.startswith(NETWORK_PREFIXES) and any(
+                self.name_of(a) == "os.environ" for a in args):
             self.env_dumps.append(node)
 
     def _check_setup(self, node):
@@ -255,7 +290,7 @@ class _Visitor(ast.NodeVisitor):
                 continue
             for key in kw.value.keys:
                 command = _const(key)
-                if command in ("install", "develop", "egg_info", "bdist_egg", "sdist"):
+                if command in ("install", "develop", "egg_info"):
                     self.add("install-hook", f"replaces the '{command}' command with its own code",
                              key)
 
@@ -277,11 +312,15 @@ class _Visitor(ast.NodeVisitor):
                              node)
                     break
 
-        for m in OBFUSCATOR.finditer(self.source):
+        m = OBFUSCATOR.search(self.source)
+        if m:
             self.findings.append(Finding("obfuscated", "deliberately scrambled code",
                                          self.path, self.source.count("\n", 0, m.start()) + 1,
                                          snippet(m.group(0))))
-            break
+        elif len(self.scrambled) >= 5:
+            names = ", ".join(sorted(self.scrambled)[:3])
+            self.findings.append(Finding("obfuscated", f"deliberately scrambled names ({names}...)",
+                                         self.path))
 
         self.findings += check_text(self.source, self.path, install_time=self.role == "setup")
         return self.findings
@@ -293,6 +332,19 @@ def _const(node) -> str | None:
     return None
 
 
+def _build_tool(args) -> bool:
+    if not args:
+        return False
+    first = args[0]
+    if isinstance(first, (ast.List, ast.Tuple)) and first.elts:
+        first = first.elts[0]
+    command = _const(first)
+    if command is None:
+        return isinstance(first, ast.Attribute) and first.attr == "executable"  # sys.executable
+    program = command.split()[0] if command.split() else ""
+    return program.rsplit("/", 1)[-1] in BUILD_TOOLS
+
+
 def _const_arg(call: ast.Call) -> str | None:
     return _const(call.args[0]) if call.args else None
 
@@ -300,10 +352,23 @@ def _const_arg(call: ast.Call) -> str | None:
 def _reads_a_file(node) -> bool:
     """exec(open("pkg/version.py").read()) is a normal way to get a version."""
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-        if node.func.attr == "read":
+        if node.func.attr in ("read", "read_text", "read_bytes"):
             return True
     return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "open"
                for n in ast.walk(node))
+
+
+def _text_only(path, source, role) -> list[Finding]:
+    found = check_text(source, path, install_time=role == "setup")
+    m = OBFUSCATOR.search(source)
+    scrambled = set(SCRAMBLED_WORD.findall(source))
+    if m:
+        found.append(Finding("obfuscated", "deliberately scrambled code", path,
+                             source.count("\n", 0, m.start()) + 1, snippet(m.group(0))))
+    elif len(scrambled) >= 5:
+        names = ", ".join(sorted(scrambled)[:3])
+        found.append(Finding("obfuscated", f"deliberately scrambled names ({names}...)", path))
+    return found
 
 
 def _scan_unparsable(path, source, role) -> list[Finding]:

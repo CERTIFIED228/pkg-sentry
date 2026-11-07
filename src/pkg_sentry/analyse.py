@@ -25,8 +25,15 @@ TEXT_EXTENSIONS = {".py", ".js", ".cjs", ".mjs", ".ts", ".json", ".txt", ".md", 
 DROPPED_PROGRAMS = {".exe", ".scr", ".vbs", ".bat", ".cmd", ".ps1", ".msi", ".com", ".jar"}
 SCRIPTS = {".sh", ".bash", ".bat", ".cmd", ".ps1", ".vbs"}
 JS = {".js", ".cjs", ".mjs"}
-NOT_IMPORTED = {"test", "tests", "testing", "example", "examples", "docs", "doc", "scripts",
-                "benchmarks", "tools", "samples", "demo"}
+DEV_DIRS = {"example", "examples", "docs", "doc", "scripts", "benchmarks", "benchmark", "bench",
+            "tools", "samples", "demo", "demos", "ci", ".github", ".circleci", "fixtures",
+            "__fixtures__", "__tests__", "__mocks__", "e2e"}
+DEV_FILES = re.compile(r"^(?:test_.*\.py|conftest\.py|.*_tests?\.py|.*\.(?:test|spec)\.[cm]?js"
+                       r"|make\.bat|gulpfile\.js|gruntfile\.js|karma\.conf\.js)$", re.IGNORECASE)
+# Code in tests, docs and build tooling doesn't run when someone installs or
+# uses the package, so only signs that are never innocent count there.
+STRONG = {"exec-decoded", "exfil-endpoint", "hidden-powershell", "disguised-binary", "pth-file",
+          "archive-escape"}
 PTH_CODE = re.compile(r"^\s*import\s", re.MULTILINE)
 PTH_DANGER = re.compile(r"exec|eval|b64decode|subprocess|urllib|socket|requests|__import__|compile")
 SENDS_DATA = {"exfil-endpoint", "raw-ip-url", "network-at-install", "env-dump", "recon",
@@ -54,42 +61,53 @@ def analyse(unpacked: Unpacked, ecosystem: str | None = None) -> list[Finding]:
             setup_dirs[posixpath.dirname(path)] = local_imports(f.text())
 
     for path, f in files.items():
-        name = posixpath.basename(path)
-        ext = posixpath.splitext(name)[1].lower()
-
-        kind = binary_kind(f.data[:72])
-        if kind and ext in TEXT_EXTENSIONS:
-            findings.append(Finding("disguised-binary", f"is {kind} pretending to be a {ext} file",
-                                    path, critical=True))
-            continue
-        if ext in DROPPED_PROGRAMS:
-            findings.append(Finding("binary-payload", f"ships {name}", path))
-
-        if ext == ".py":
-            findings += scan_python(path, f.text(), _python_role(path, setup_dirs))
-        elif ext == ".pth":
-            findings += _check_pth(path, f.text())
-        elif ext in JS:
-            findings += scan_js(path, f.text(), install_time=path in install_files)
-        elif ext in SCRIPTS:
-            findings += check_text(f.text(), path)
+        dev = is_dev_file(path) and path not in install_files
+        found = _check_file(path, f, setup_dirs, install_files, dev)
+        if dev:
+            found = [x for x in found if x.rule in STRONG]
+        findings += found
 
     findings += _combine(findings)
     return _without_duplicates(findings)
 
 
+def _check_file(path, f, setup_dirs, install_files, dev) -> list[Finding]:
+    name = posixpath.basename(path)
+    ext = posixpath.splitext(name)[1].lower()
+    kind = binary_kind(f.data[:72])
+    if kind and ext in TEXT_EXTENSIONS:
+        return [Finding("disguised-binary", f"is {kind} pretending to be a {ext} file",
+                        path, critical=True)]
+    found = []
+    if ext in DROPPED_PROGRAMS:
+        found.append(Finding("binary-payload", f"ships {name}", path))
+    if ext == ".py":
+        role = "runtime" if dev else _python_role(path, setup_dirs)
+        found += scan_python(path, f.text(), role)
+    elif ext == ".pth":
+        found += _check_pth(path, f.text())
+    elif ext in JS:
+        found += scan_js(path, f.text(), install_time=path in install_files)
+    elif ext in SCRIPTS:
+        found += check_text(f.text(), path)
+    return found
+
+
+def is_dev_file(path: str) -> bool:
+    folders = [p.lower() for p in path.split("/")[:-1]]
+    if any(p in DEV_DIRS or p.startswith("test") or p.endswith("tests") for p in folders):
+        return True
+    return bool(DEV_FILES.match(posixpath.basename(path)))
+
+
 def _python_role(path: str, setup_dirs: dict[str, set[str]]) -> str:
     folder, name = posixpath.split(path)
-    if name == "setup.py":
+    stem = name[:-3]
+    if name == "setup.py" or stem in setup_dirs.get(folder, ()):
         return "setup"
-    if name[:-3] in setup_dirs.get(folder, ()):
-        return "setup"
-    # Module-level code in any module runs when it's imported. Tests, examples
-    # and docs aren't imported by users, so they don't count.
-    parts = set(path.lower().split("/")[:-1])
-    if parts & NOT_IMPORTED or name.startswith(("test_", "conftest")):
-        return "runtime"
-    return "import"
+    # Module-level code in any module runs when it's imported. A file whose
+    # name isn't a valid identifier (run-bench.py) can't be imported.
+    return "import" if stem.isidentifier() else "runtime"
 
 
 def _check_pth(path: str, text: str) -> list[Finding]:
@@ -104,14 +122,18 @@ def _check_pth(path: str, text: str) -> list[Finding]:
 
 
 def _combine(findings: list[Finding]) -> list[Finding]:
+    """Reading secrets is only theft if there's also a way to send them out.
+    One kind of credential is normal for a tool (an AWS library reads ~/.aws);
+    several kinds, or browser and wallet data, is what stealers collect."""
     rules = {f.rule for f in findings}
-    extra = []
-    if "secrets" in rules and rules & SENDS_DATA:
-        secret = next(f for f in findings if f.rule == "secrets")
-        extra.append(Finding("steals-secrets", "reads credentials and has a way to send them out",
-                             secret.path, secret.line, secret.snippet,
-                             critical="exfil-endpoint" in rules))
-    return extra
+    looted = [f for f in findings if f.rule == "secrets"]
+    creds = [f for f in findings if f.rule == "credentials"]
+    kinds = {f.message.lower().replace("\\", "/") for f in creds}
+    if not (rules & SENDS_DATA) or not (looted or len(kinds) >= 2):
+        return []
+    first = (looted or creds)[0]
+    return [Finding("steals-secrets", "reads credentials and has a way to send them out",
+                    first.path, first.line, first.snippet, critical="exfil-endpoint" in rules)]
 
 
 def _without_duplicates(findings: list[Finding]) -> list[Finding]:

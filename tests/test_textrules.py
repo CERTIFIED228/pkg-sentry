@@ -28,14 +28,27 @@ def test_exfil_endpoints(text):
 @pytest.mark.parametrize(
     "text",
     [
-        "~/.ssh/id_rsa", "C:\\\\Users\\\\x\\\\.ssh\\\\id_ed25519", "~/.aws/credentials",
         "Google\\\\Chrome\\\\User Data\\\\Default\\\\Login Data", "Local State",
-        "discord\\\\Local Storage\\\\leveldb", "wallet.dat", "/etc/shadow", "~/.npmrc",
-        "nkbihfbeogaeaoehlefnkodbefgpgknn",
+        "discord\\\\Local Storage\\\\leveldb", "wallet.dat", "/etc/shadow",
+        "nkbihfbeogaeaoehlefnkodbefgpgknn", "Default/Network/Cookies",
     ],
 )
-def test_secret_paths(text):
+def test_browser_chat_and_wallet_data(text):
     assert rules(f"p = '{text}'") == ["secrets"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["~/.ssh/id_rsa", "C:\\\\Users\\\\x\\\\.ssh\\\\id_ed25519", "~/.aws/credentials", "~/.npmrc",
+     "~/.kube/config"],
+)
+def test_ordinary_credentials(text):
+    assert rules(f"p = '{text}'") == ["credentials"]
+
+
+def test_the_word_cookies_is_fine():
+    assert rules("from django.contrib.sessions.backends import signed_cookies") == []
+    assert rules("SESSION_ENGINE = 'signed_cookies'") == []
 
 
 @pytest.mark.parametrize(
@@ -87,10 +100,15 @@ def test_curl_alone_is_fine():
         "schtasks /create /tn upd /tr x.exe",
         "~/Library/LaunchAgents/com.x.plist",
         "echo x >> ~/.bashrc",
+        "open(os.path.expanduser('~/.bashrc'), 'a')",
     ],
 )
 def test_persistence(text):
     assert rules(text) == ["persistence"]
+
+
+def test_sourcing_bashrc_is_fine():
+    assert rules("tmprc.write('[ -e ~/.bashrc ] && . ~/.bashrc')") == []
 
 
 def test_raw_ip_urls():
