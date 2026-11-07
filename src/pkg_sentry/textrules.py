@@ -13,7 +13,7 @@ EXFIL = re.compile(
     r"|api\.telegram\.org/bot"
     r"|\bngrok(?:-free)?\.(?:io|app|dev)\b"
     r"|\bpipedream\.net\b|\bwebhook\.site\b|\brequestbin\.\w+|\bhookbin\.com\b|\bbeeceptor\.com\b"
-    r"|\binteract\.sh\b|\boast\.(?:pro|live|site|online|fun|me)\b|burpcollaborator\.net"
+    r"|\binteract\.sh\b|\boast\.(?:pro|live|site|online|fun|me)\b|burpcollaborator\.net|\boastify\.com\b"
     r"|\bdnslog\.cn\b|\bceye\.io\b|\bcanarytokens\.com\b"
     r"|\btransfer\.sh\b|\bfile\.io\b|\bgofile\.io\b|\banonfiles\.com\b"
     r"|pastebin\.com/raw|\bpaste\.ee/r/|\brentry\.co\b",
@@ -76,7 +76,8 @@ def check_text(text: str, path: str, line_of=None, install_time: bool = False) -
                              snippet(text[start: match.end() + 30]), critical))
 
     for m in EXFIL.finditer(text):
-        add("exfil-endpoint", f"sends data to {m.group(0).split('/')[0]}", m)
+        add("exfil-endpoint", f"sends data to {m.group(0).split('/')[0]}", m,
+            critical=install_time)
     for m in SECRET_PATHS.finditer(text):
         add("secrets", f"reads {m.group(0).strip(chr(39) + chr(34))}", m)
     for m in POWERSHELL.finditer(text):

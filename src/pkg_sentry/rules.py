@@ -33,6 +33,7 @@ RULES = {
     "raw-ip-url": (20, "talks to a bare IP address"),
     "obfuscated": (25, "deliberately scrambled code"),
     "persistence": (25, "sets itself up to run again later"),
+    "self-publish": (35, "publishes packages by itself, like spam or a worm"),
     "shell": (5, "runs shell commands"),
     # archive
     "archive-escape": (30, "tries to write files outside the package"),

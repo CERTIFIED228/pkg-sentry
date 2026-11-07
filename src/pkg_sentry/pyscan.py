@@ -8,6 +8,7 @@ still get the text checks.
 
 import ast
 import re
+import warnings
 
 from .rules import Finding, snippet
 from .textrules import check_text
@@ -43,18 +44,27 @@ def scan_python(path: str, source: str, role: str = "runtime") -> list[Finding]:
     """role: "setup" (everything runs at install), "import" (module-level
     code runs when imported) or "runtime"."""
     try:
-        tree = ast.parse(source)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tree = ast.parse(source)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return _scan_unparsable(path, source, role)
     visitor = _Visitor(path, source, role)
-    visitor.visit(tree)
+    try:
+        visitor.visit(tree)
+    except RecursionError:
+        # Absurdly deep code. Don't let it crash the scan (that alone would be
+        # a way to hide a payload); fall back to the text checks.
+        return _scan_unparsable(path, source, role)
     return visitor.finish()
 
 
 def local_imports(source: str) -> set[str]:
     """Top-level module names a setup.py imports (from main import run -> "main")."""
     try:
-        tree = ast.parse(source)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tree = ast.parse(source)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return set()
     names = set()
@@ -127,6 +137,12 @@ class _Visitor(ast.NodeVisitor):
         if name:
             self.calls.append((name, node, self.install_time))
             self._check_call(name, node)
+        if name in ("__import__", "importlib.import_module") and node.args:
+            if not _const(node.args[0]) and any(
+                isinstance(n, ast.Call) and self.name_of(n.func) == "chr"
+                for n in ast.walk(node.args[0])
+            ):
+                self.add("obfuscated", "hides which module it imports", node)
         if name == "setup" or (name or "").endswith(".setup"):
             self._check_setup(node)
         self.generic_visit(node)

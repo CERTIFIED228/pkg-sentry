@@ -150,6 +150,13 @@ def test_unparsable_files_still_get_text_checks():
     assert found == ["exec-decoded"]
 
 
+def test_absurdly_deep_code_does_not_crash_the_scan():
+    deep = "x = " + " + ".join(["1"] * 50_000) + "\nurl = 'https://webhook.site/abc'"
+    assert "exfil-endpoint" in rules(deep)
+    nested = "x = " + "[" * 5000 + "]" * 5000
+    assert rules(nested) == []
+
+
 # Normal code that must stay quiet.
 
 @pytest.mark.parametrize(

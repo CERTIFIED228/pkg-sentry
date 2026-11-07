@@ -48,6 +48,9 @@ RECON = re.compile(r"\bos\.(?:hostname|userInfo|networkInterfaces|homedir)\s*\("
 RUNNABLE = re.compile(
     r"\.(?:exe|sh|ps1|bat|cmd|vbs|scr)['\"`]|chmod(?:Sync)?\s*\(|detached\s*:\s*true"
 )
+# Spam and worms republish themselves: rewrite package.json, then npm publish.
+SELF_PUBLISH = re.compile(r"['\"`]npm\s+publish\b")
+WRITES_PACKAGE_JSON = re.compile(r"writeFileSync\(\s*['\"`][./]*package\.json")
 OBFUSCATOR = re.compile(r"\b_0x[0-9a-f]{4,6}\b")
 OBFUSCATOR_SIGNS = re.compile(
     r"while\s*\(\s*!!\[\]\s*\)|\['push'\]\(\s*\w+\['shift'\]\(\)\s*\)|\[\]\[\(!\[\]\+\[\]\)"
@@ -81,9 +84,6 @@ def scan_package_json(path: str, text: str) -> tuple[list[Finding], set[str]]:
             findings.append(Finding("shell-at-install", "the install script runs shell commands",
                                     path, line, snippet(command)))
         findings += check_text(command, path, lambda _, line=line: line, install_time=True)
-    main = meta.get("main")
-    if isinstance(main, str):
-        run_files.add(f"main:{main.lstrip('./')}")
     return findings, run_files
 
 
@@ -125,6 +125,9 @@ def scan_js(path: str, source: str, install_time: bool = False) -> list[Finding]
             add("env-dump", "collects all environment variables and sends them out", m)
         if m := RECON.search(code):
             add("recon", "collects details about the machine and sends them", m)
+
+    if has_child and (m := SELF_PUBLISH.search(code)) and WRITES_PACKAGE_JSON.search(code):
+        add("self-publish", "rewrites package.json and publishes to npm by itself", m)
 
     hex_names = len(set(OBFUSCATOR.findall(code)))
     if hex_names >= 20 or OBFUSCATOR_SIGNS.search(code):

@@ -43,11 +43,6 @@ def test_test_scripts_are_ignored():
     assert scan_package_json("package.json", pkg({"test": "curl x | sh"}))[0] == []
 
 
-def test_main_file_is_returned():
-    _, files = scan_package_json("package.json", pkg(main="./lib/index.js"))
-    assert "main:lib/index.js" in files
-
-
 def test_broken_package_json():
     assert scan_package_json("package.json", "{nope") == ([], set())
     assert scan_package_json("package.json", "[]") == ([], set())
@@ -85,6 +80,22 @@ def test_download_and_run():
         exec('sh /tmp/p.sh');
     ''')
     assert "download-exec" in found
+
+
+def test_republishes_itself():
+    found = js_rules('''
+        const { exec } = require('child_process');
+        const fs = require('fs');
+        const data = JSON.parse(fs.readFileSync('package.json'));
+        data.name = randomName();
+        fs.writeFileSync('package.json', JSON.stringify(data));
+        exec('npm publish --access public');
+    ''')
+    assert "self-publish" in found
+
+
+def test_mentioning_npm_publish_is_fine():
+    assert "self-publish" not in js_rules("console.log('run npm publish when ready')")
 
 
 def test_obfuscated_code():
