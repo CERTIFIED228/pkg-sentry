@@ -75,7 +75,7 @@ def malware(root: Path, split: str):
             if (found_on < CUTOFF) != (split == "dev"):
                 continue
             name = path.parent.parent.name
-            yield ecosystem, name, path.parent.parent.parent.name, lambda p=path: load_sample(p)
+            yield ecosystem, name, path.parent.parent.parent.name, lambda p=path: [load_sample(p)]
 
 
 def popular(root: Path, split: str):
@@ -89,18 +89,18 @@ def popular(root: Path, split: str):
             if even != (split == "dev"):
                 continue
 
-            def load(folder=folder, info=info):
-                merged = Unpacked()
+            def load(folder=folder, info=info, ecosystem=ecosystem):
+                # Each file on its own, the way `pkg-sentry check` reads them.
+                parts = []
                 for filename in info["files"]:
+                    data = (folder / filename).read_bytes()
                     try:
-                        part = unpack((folder / filename).read_bytes()).strip_top_dir()
+                        part = (unpack(data, npm=True) if ecosystem == "npm"
+                                else unpack(data).strip_top_dir())
                     except ArchiveError:
                         continue
-                    merged.files += [File(f"{filename}/{f.path}", f.data) for f in part.files]
-                    merged.suspicious += part.suspicious
-                    # Code that couldn't be read counts against a package, so it's measured too.
-                    merged.skipped += part.skipped
-                return merged
+                    parts.append(part)
+                return parts
 
             yield ecosystem, info["name"], "popular", load
 
@@ -110,11 +110,12 @@ def run(packages, label, show):
     start = time.time()
     for ecosystem, name, kind, load in packages:
         began = time.time()
-        unpacked = load()
-        if not unpacked.files and not unpacked.suspicious:
+        parts = load()
+        if not any(p.files or p.suspicious for p in parts):
             empty += 1
             continue
-        findings = analyse(unpacked, ecosystem) + name_findings(ecosystem, name)
+        findings = [f for p in parts for f in analyse(p, ecosystem)]
+        findings += name_findings(ecosystem, name)
         verdict = judge(findings)
         levels[verdict.severity] += 1
         rules.update({f.rule for f in findings})
