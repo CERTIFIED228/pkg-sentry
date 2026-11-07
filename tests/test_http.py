@@ -75,3 +75,9 @@ def test_post_json(server):
 def test_unreachable_host():
     with pytest.raises(http.FetchError):
         http.get("http://127.0.0.1:9/", retries=0, timeout=2)
+
+
+def test_cut_off_downloads_are_an_error(server):
+    server["/short"] = (200, b"x" * 10, {"Content-Length": "100000"})
+    with pytest.raises(http.FetchError):
+        http.get(server.url + "/short", retries=0)
