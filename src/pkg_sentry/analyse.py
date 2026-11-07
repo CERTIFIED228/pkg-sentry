@@ -17,7 +17,7 @@ import re
 
 from .archive import Unpacked
 from .jsscan import local_requires, scan_gyp, scan_js, scan_package_json
-from .pyscan import file_references, imports_of, scan_python
+from .pyscan import file_references, imports_of, scan_python, used_imports
 from .rules import Finding, snippet
 from .textrules import PER_RULE, binary_kind, check_text
 
@@ -67,7 +67,7 @@ def analyse(unpacked: Unpacked, ecosystem: str | None = None) -> list[Finding]:
 
     packages = {posixpath.dirname(p) for p in files if posixpath.basename(p) == "__init__.py"}
     install_files: set[str] = set()
-    setup_files: set[str] = set()
+    setup_files: dict[str, str] = {}
     if ecosystem == "npm":
         root = root_package_json(files)
         if root:
@@ -157,40 +157,58 @@ def is_dev_file(path: str, packages=frozenset()) -> bool:
     return bool(DEV_FILES.match(posixpath.basename(path)))
 
 
-def _python_role(path: str, setup_files: set[str], packages: set[str]) -> str:
+def _python_role(path: str, setup_files: dict[str, str], packages: set[str]) -> str:
     folder, name = posixpath.split(path)
     if path in setup_files:
-        return "setup"
+        return setup_files[path]
     # Module-level code runs when the module is imported. That needs a name
     # Python can import (not run-bench.py) inside a package, or at the top.
     importable = folder in packages or folder in ("", "src")
     return "import" if name[:-3].isidentifier() and importable else "runtime"
 
 
-def _setup_files(files) -> set[str]:
-    """setup.py, and everything it pulls in, followed from file to file."""
+def _setup_files(files) -> dict[str, str]:
+    """What runs during `pip install`, and how much of it: "setup" means all
+    of a file's code counts, "import" means only its top level runs.
+
+    - setup.py, an in-tree build backend, and files they run or exec are
+      "setup", and everything they call into is followed.
+    - A module whose functions get called (or that's handed to setup() as a
+      cmdclass) is "setup" too, but only its top level is followed further.
+      Following every call of every called function would pull in the whole
+      build toolchain (mypy's setup.py calls mypyc, which calls all of mypy).
+    - A module that's only imported is "import"."""
     start = [p for p in files if posixpath.basename(p) == "setup.py"] + _build_backend(files)
     roots = {posixpath.dirname(p) for p in start} | {""}
-    seen: set[str] = set()
-    queue = list(start)
-    while queue and len(seen) < FOLLOW_LIMIT:
-        path = queue.pop()
-        if path in seen:
+    rank: dict[str, int] = {}  # 0 imported, 1 called into, 2 run whole
+    queue = [(p, 2) for p in start]
+    while queue and len(rank) < FOLLOW_LIMIT:
+        path, level_ = queue.pop()
+        if rank.get(path, -1) >= level_:
             continue
-        seen.add(path)
+        rank[path] = level_
         if not path.endswith(".py"):
             continue  # only follow imports and paths out of Python
         data, base = files[path].data, posixpath.dirname(path)
+        everywhere = level_ == 2
+        here = roots | {base}
         for level, dotted in imports_of(data):
-            queue += _module_files(dotted, level, base, roots | {base}, files)
-        for ref in file_references(data):
+            queue += [(m, 0) for m in _module_files(dotted, level, base, here, files)]
+        for level, dotted in used_imports(data, everywhere):
+            queue += [(m, 1) for m in _module_files(dotted, level, base, here, files,
+                                                    deepest=True)]
+        for ref in file_references(data, everywhere):
             for candidate in (posixpath.normpath(posixpath.join(base, ref)), ref):
                 if candidate in files:
-                    queue.append(candidate)
-    return seen
+                    queue.append((candidate, 2))
+    return {path: "setup" if r else "import" for path, r in rank.items()}
 
 
-def _module_files(dotted: str, level: int, base: str, roots: set[str], files) -> list[str]:
+def _module_files(dotted: str, level: int, base: str, roots: set[str], files,
+                  deepest: bool = False) -> list[str]:
+    """The files `import dotted` runs: every package's __init__.py on the way
+    down, then the module itself. With deepest, only the module the name
+    ends up in (`helpers.go` is a function in helpers/__init__.py)."""
     if level:
         anchor = base
         for _ in range(level - 1):
@@ -199,13 +217,17 @@ def _module_files(dotted: str, level: int, base: str, roots: set[str], files) ->
     parts = [p for p in dotted.split(".") if p]
     found = []
     for root in roots:
+        here = []
         for i in range(len(parts) + 1):
+            if not i and not level:
+                continue
             stem = posixpath.join(root, *parts[:i]) if i else root
-            for candidate in (f"{stem}.py", f"{stem}.pyc", f"{stem}/__init__.py"):
-                candidate = candidate.lstrip("/")
-                if i and candidate in files or (not i and level and candidate.endswith(
-                        "__init__.py") and candidate in files):
-                    found.append(candidate)
+            matches = [c.lstrip("/") for c in (f"{stem}.py", f"{stem}.pyc", f"{stem}/__init__.py")
+                       if c.lstrip("/") in files and (i or c.endswith("__init__.py"))]
+            if matches:
+                here.append(matches)
+        if here:
+            found += here[-1] if deepest else [m for group in here for m in group]
     return found
 
 
@@ -217,11 +239,13 @@ def _build_backend(files) -> list[str]:
         return []
     text = files[root].text()
     base = posixpath.dirname(root)
-    dirs = {base}
+    dirs = set()
     for group in re.findall(r"backend-path\s*=\s*\[([^\]]{0,500})\]", text):
         dirs |= {posixpath.normpath(posixpath.join(base, d)).lstrip("./")
                  for d in re.findall(r"['\"]([^'\"]{1,200})['\"]", group)}
-    modules = re.findall(r"build-backend\s*=\s*['\"]([\w.]+)", text)
+    # Without backend-path the backend comes from PyPI, not from this package.
+    modules = re.findall(r"build-backend\s*=\s*['\"]([\w.]+)", text) if dirs else []
+    dirs.add(base)
     cmdclass = re.search(r"\[tool\.setuptools\.cmdclass\]([^\[]{0,2000})", text)
     if cmdclass:
         modules += [m.rsplit(".", 1)[0] for m in re.findall(r"=\s*['\"]([\w.]+)['\"]",

