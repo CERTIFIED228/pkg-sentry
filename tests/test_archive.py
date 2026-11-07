@@ -233,3 +233,18 @@ def test_a_normal_tarball_has_nothing_after_its_end():
 def test_data_after_the_gzip_stream():
     result = unpack(make_tar([("package/index.js", b"x")]) + b"trailing junk", npm=True)
     assert ("*", "there's data after the compressed archive") in result.skipped
+
+
+def test_zero_padding_after_the_gzip_stream_is_fine():
+    data = make_tar([("package/index.js", b"x")]) + b"\0" * 4096
+    result = unpack(data, npm=True)
+    assert result.skipped == [] and [f.path for f in result.files] == ["index.js"]
+
+
+def test_reading_past_the_end_stays_at_the_end():
+    from pkg_sentry.archive import _Gunzip
+
+    stream = _Gunzip(gzip.compress(b"hello") + b"\0" * 100, 1_000_000)
+    assert stream.read(1000) == b"hello"
+    assert [stream.read(1000) for _ in range(5)] == [b""] * 5
+    assert not stream.trailing

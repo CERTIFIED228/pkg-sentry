@@ -117,25 +117,26 @@ class _Gunzip(_Tracked):
         self.data, self.cap, self.at = data, cap, 0
         self.inflater = zlib.decompressobj(31)
         self.pending = b""
-        self.trailing = self.truncated = False
+        self.trailing = self.truncated = self.finished = False
 
     def _read(self, size) -> bytes:
         want = size if size and size > 0 else 1 << 20
         out = b""
-        while len(out) < want:
+        while len(out) < want and not self.finished:
             if self.inflater.eof:
                 # This member is done: carry on with the next one, if any.
                 self.at -= len(self.inflater.unused_data)
                 rest = self.data[self.at:]
                 if rest[:2] != b"\x1f\x8b":
                     self.trailing = bool(rest.strip(b"\0"))
+                    self.finished = True
                     break
                 self.inflater, self.pending = zlib.decompressobj(31), b""
             if not self.pending:
                 self.pending = self.data[self.at:self.at + 65536]
                 self.at += len(self.pending)
                 if not self.pending:
-                    self.truncated = True
+                    self.truncated = self.finished = True
                     break
             out += self.inflater.decompress(self.pending, want - len(out))
             self.pending = self.inflater.unconsumed_tail
