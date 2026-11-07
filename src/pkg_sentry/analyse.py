@@ -53,6 +53,11 @@ PTH_CALLS = {"os.path.join", "os.path.dirname", "os.path.exists", "sys._getframe
              "sys.modules.setdefault", "importlib.util.module_from_spec",
              "importlib.machinery.PathFinder.find_spec", "types.ModuleType", "os.environ.get",
              "m.__dict__.setdefault", "mp.append"}
+# Where a wheel's .data folders install to: straight into site-packages.
+SITE_ROOT = re.compile(
+    r"(?:^|/)[^/]+\.data/(?:purelib|platlib|data/lib/python[\d.]*/site-packages)$")
+# Python runs these every time it starts, if they're in site-packages.
+STARTUP_MODULES = {"sitecustomize.py", "usercustomize.py"}
 SENDS_DATA = {"exfil-endpoint", "raw-ip-url", "network-at-install", "env-dump", "recon",
               "download-exec", "fetch-and-run"}
 FOLLOW_LIMIT = 300
@@ -78,6 +83,9 @@ def analyse(unpacked: Unpacked, ecosystem: str | None = None) -> list[Finding]:
                 {posixpath.normpath(posixpath.join(base, f)) for f in run_files}, files)
     else:
         setup_files = _setup_files(files)
+        # A module a .pth file imports runs every time Python starts.
+        for module in _pth_imports(files):
+            setup_files.setdefault(module, "import")
 
     for path, f in files.items():
         ext = posixpath.splitext(path)[1].lower()
@@ -109,7 +117,12 @@ def _check_file(path, f, ecosystem, setup_files, install_files, packages, dev) -
         found += check_text(f.text(), path, install_time=True)
     elif ext == ".py":
         role = "runtime" if dev else _python_role(path, setup_files, packages)
-        found += scan_python(path, f.data, role, during_install=path in setup_files)
+        folder = posixpath.dirname(path)
+        startup = name in STARTUP_MODULES and (folder in ("", "src") or SITE_ROOT.search(folder))
+        if startup:
+            found.append(Finding("pth-code", f"ships {name}, which Python runs every time it "
+                                 "starts", path))
+        found += scan_python(path, f.data, role, during_install=path in setup_files or startup)
     elif ext == ".pyc":
         loaded = path in setup_files
         found.append(Finding("compiled-python",
@@ -163,7 +176,7 @@ def _python_role(path: str, setup_files: dict[str, str], packages: set[str]) -> 
         return setup_files[path]
     # Module-level code runs when the module is imported. That needs a name
     # Python can import (not run-bench.py) inside a package, or at the top.
-    importable = folder in packages or folder in ("", "src")
+    importable = folder in packages or folder in ("", "src") or SITE_ROOT.search(folder)
     return "import" if name[:-3].isidentifier() and importable else "runtime"
 
 
@@ -290,6 +303,23 @@ def _check_pth(path: str, text: str) -> list[Finding]:
             found.append(Finding("pth-code", "has a .pth file that runs a line of code every time "
                                  "Python starts", path, number, snippet(line)))
     return found + check_text(text, path, install_time=True)
+
+
+def _pth_imports(files) -> set[str]:
+    found = set()
+    for path, f in files.items():
+        if not path.endswith(".pth"):
+            continue
+        root = posixpath.dirname(path)
+        for line in f.text().splitlines()[:200]:
+            if not line.lstrip().startswith("import"):
+                continue
+            names = re.findall(r"__import__\(\s*['\"]([\w.]+)['\"]", line)
+            names += re.findall(r"(?:^|;)\s*import\s+([\w.]+(?:\s*,\s*[\w.]+)*)", line)
+            for group in names:
+                for name in group.split(","):
+                    found.update(_module_files(name.strip(), 0, root, {root, ""}, files))
+    return found
 
 
 def _known_pth(line: str) -> bool:

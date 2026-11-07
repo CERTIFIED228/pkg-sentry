@@ -196,9 +196,12 @@ def used_imports(data: bytes | str, everywhere: bool = True) -> set[tuple[int, s
         targets = []
         if isinstance(node, ast.Call):
             targets.append(node.func)
-            # cmdclass={"install": helpers.PostInstall} runs during pip install
-            targets += [v for k in node.keywords if k.arg == "cmdclass"
-                        and isinstance(k.value, ast.Dict) for v in k.value.values]
+            if isinstance(node.func, ast.Name) and node.func.id == "dict":
+                targets += [k.value for k in node.keywords]
+        elif isinstance(node, ast.Dict):
+            # cmdclass={"install": helpers.PostInstall} runs during pip install,
+            # and so does the same dict built first and passed as a variable.
+            targets += node.values
         elif isinstance(node, ast.ClassDef):
             targets += node.bases
         for target in targets:
