@@ -27,7 +27,11 @@ SCRIPTS = {".sh", ".bash", ".bat", ".cmd", ".ps1", ".vbs"}
 JS = {".js", ".cjs", ".mjs"}
 DEV_DIRS = {"example", "examples", "docs", "doc", "scripts", "benchmarks", "benchmark", "bench",
             "tools", "samples", "demo", "demos", "ci", ".github", ".circleci", "fixtures",
-            "__fixtures__", "__tests__", "__mocks__", "e2e"}
+            "__fixtures__", "__tests__", "__mocks__", "e2e", "dev", "winbuild", ".evergreen"}
+# Files in the other ecosystem's language don't run on install or import:
+# JavaScript in a PyPI package is a web asset, Python in an npm package a helper.
+OWN_CODE = {"pypi": {".py", ".pth"}, "npm": {".js", ".cjs", ".mjs"}}
+FOREIGN_CODE = {".py", ".js", ".cjs", ".mjs"}
 DEV_FILES = re.compile(r"^(?:test_.*\.py|conftest\.py|.*_tests?\.py|.*\.(?:test|spec)\.[cm]?js"
                        r"|make\.bat|gulpfile\.js|gruntfile\.js|karma\.conf\.js)$", re.IGNORECASE)
 # Code in tests, docs and build tooling doesn't run when someone installs or
@@ -62,7 +66,9 @@ def analyse(unpacked: Unpacked, ecosystem: str | None = None) -> list[Finding]:
             setup_dirs[posixpath.dirname(path)] = local_imports(f.text())
 
     for path, f in files.items():
-        dev = is_dev_file(path) and path not in install_files
+        ext = posixpath.splitext(path)[1].lower()
+        foreign = ext in FOREIGN_CODE and ext not in OWN_CODE.get(ecosystem, FOREIGN_CODE)
+        dev = (is_dev_file(path) or foreign) and path not in install_files
         found = _check_file(path, f, setup_dirs, install_files, packages, dev)
         if dev:
             found = [x for x in found if x.rule in STRONG]

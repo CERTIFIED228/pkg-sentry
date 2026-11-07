@@ -34,9 +34,15 @@ DUMPERS = {"dict", "str", "repr", "json.dumps", "urllib.parse.urlencode", "list"
 # Commands people run from setup.py while building, not to attack anyone.
 BUILD_TOOLS = {"git", "cmake", "make", "gcc", "cc", "g++", "clang", "pkg-config", "cython",
                "nvcc", "xcrun", "hipcc", "ninja", "meson", "cargo", "rustc", "swig", "uname",
-               "nproc", "which", "where", "lsb_release", "sw_vers", "python", "python3"}
+               "nproc", "which", "where", "lsb_release", "sw_vers", "python", "python3", "brew",
+               "twine", "pip", "pip3", "tox", "coverage", "patchelf", "install_name_tool",
+               "otool", "ldd", "autoreconf", "autogen.sh", "configure", "rm", "cp", "mv", "mkdir",
+               "npm", "yarn", "node", "protoc", "f2py", "sphinx-build", "ps"}
+SHELLS = {"sh", "bash", "/bin/sh", "/bin/bash"}
 RUNNABLE = re.compile(r"\.(?:exe|bat|cmd|ps1|vbs|scr|msi|sh)\b", re.IGNORECASE)
-OBFUSCATOR = re.compile(r"__pyarmor__|pyarmor_runtime|PyObfuscator|BlankOBF|pyobfuscate")
+OBFUSCATOR = re.compile(
+    r"\bfrom\s+pyarmor_runtime\w*\s+import|__pyarmor__\s*\(|Obfuscated (?:with|by) "
+)
 # Names obfuscators generate: IlIlIlIl, OO0O0O0O, _0x1f2a, __________1
 SCRAMBLED_NAME = re.compile(r"^(?:[Il]{6,}|[O0]{6,}|_0x[0-9a-f]{3,}|_{4,}\d*)$")
 SCRAMBLED_WORD = re.compile(r"\b(?:[Il]{6,}|O[O0]{5,}|_0x[0-9a-f]{3,})\b")
@@ -307,7 +313,7 @@ class _Visitor(ast.NodeVisitor):
             for name, node, install_time in self.calls:
                 if name == "runs-a-program":
                     self.add("download-exec", "downloads a program and starts it", node,
-                             critical=install_time)
+                             critical=install_time, points=None if install_time else 25)
             if self.env_dumps:
                 self.add("env-dump", "collects all environment variables and sends them out",
                          self.env_dumps[0])
@@ -346,7 +352,16 @@ def _build_tool(args) -> bool:
     command = _const(first)
     if command is None:
         return isinstance(first, ast.Attribute) and first.attr == "executable"  # sys.executable
-    program = command.split()[0] if command.split() else ""
+    words = command.split()
+    if isinstance(args[0], (ast.List, ast.Tuple)):
+        words = [_const(e) or "" for e in args[0].elts]
+    if not words:
+        return False
+    program = words[0]
+    # Running the package's own build script: ./build.sh, sh autogen.sh (not sh -c "...")
+    script = words[1] if program in SHELLS and len(words) > 1 else program
+    if script.endswith(".sh") and not script.startswith(("/", "http")):
+        return True
     return program.rsplit("/", 1)[-1] in BUILD_TOOLS
 
 

