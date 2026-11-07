@@ -34,7 +34,67 @@ mypkg @ https://example.com/mypkg.whl
         PackageSpec("pypi", "numpy"),
     ]
     assert len(notes) == 5
-    assert "skipped option '-r'" in notes[0]
+    assert notes[0].startswith("couldn't read other.txt")
+    assert "dependency confusion" in notes[1]
+
+
+def test_requirements_from_pip_compile(tmp_path):
+    path = write(tmp_path, "requirements.txt", """
+requests==2.31.0 \\
+    --hash=sha256:aaaa \\
+    --hash=sha256:bbbb
+    # via -r requirements.in
+urllib3==1.26.5 --hash=sha256:cccc
+""")
+    specs, notes = read_project(path)
+    assert specs == [PackageSpec("pypi", "requests", "2.31.0"),
+                     PackageSpec("pypi", "urllib3", "1.26.5")]
+    assert notes == []
+
+
+def test_requirements_follow_r_includes(tmp_path):
+    write(tmp_path, "base.txt", "flask==3.0.0\n-r requirements.txt\n")
+    path = write(tmp_path, "requirements.txt", "-r base.txt\nrequests==2.31.0\n")
+    specs, _ = read_project(path)
+    assert specs == [PackageSpec("pypi", "flask", "3.0.0"),
+                     PackageSpec("pypi", "requests", "2.31.0")]  # the loop back is ignored
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="tomllib")
+def test_poetry(tmp_path):
+    path = write(tmp_path, "pyproject.toml", """
+[tool.poetry.dependencies]
+python = "^3.10"
+requests = "2.31.0"
+click = "^8.1"
+local = {path = "../local"}
+[tool.poetry.group.dev.dependencies]
+pytest = {version = "8.0.0"}
+""")
+    specs, _ = read_project(path)
+    assert specs == [PackageSpec("pypi", "requests", "2.31.0"), PackageSpec("pypi", "click"),
+                     PackageSpec("pypi", "pytest", "8.0.0")]
+
+
+def test_scoped_npm_alias(tmp_path):
+    path = write(tmp_path, "package.json", {"dependencies": {"core": "npm:@babel/core@7.0.0"}})
+    assert read_project(path)[0] == [PackageSpec("npm", "@babel/core", "7.0.0")]
+
+
+def test_lockfile_oddities_dont_crash(tmp_path):
+    path = write(tmp_path, "package-lock.json", {"lockfileVersion": 3, "packages": {
+        "": {"name": "app"},
+        "node_modules/vendored": {"version": "1.0.0", "resolved": "file:vendor/v-1.0.0.tgz"},
+        "node_modules/weird": "not an object",
+        "node_modules/ok": {"version": "1.2.3",
+                            "resolved": "https://registry.npmjs.org/ok/-/ok-1.2.3.tgz"},
+        "node_modules/evil": {"version": "1.0.0",
+                              "resolved": "https://registry.npmjs.org.evil.example/e.tgz"},
+    }})
+    specs, notes = read_project(path)
+    assert specs == [PackageSpec("npm", "ok", "1.2.3")]
+    assert any("file:vendor" in n for n in notes)
+    assert any("registry.npmjs.org.evil.example" in n for n in notes)
 
 
 @pytest.mark.skipif(sys.version_info < (3, 11), reason="tomllib")
@@ -112,3 +172,9 @@ def test_bad_files(tmp_path, name, text):
 def test_missing_file(tmp_path):
     with pytest.raises(ProjectError):
         read_project(tmp_path / "requirements.txt")
+
+
+def test_requirements_saved_with_a_bom(tmp_path):
+    path = tmp_path / "requirements.txt"
+    path.write_bytes(b"\xef\xbb\xbfrequests==2.31.0\n")
+    assert read_project(path)[0] == [PackageSpec("pypi", "requests", "2.31.0")]
