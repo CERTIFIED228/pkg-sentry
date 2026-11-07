@@ -53,6 +53,10 @@ class Checker:
         known = self._known(spec, version, notes)
         findings += known
 
+        squat = load_popular(spec.ecosystem).squats(info.name if info else spec.name)
+        if squat:
+            findings.append(Finding("typosquat", f"the name looks like {squat.how}"))
+
         if info is None:
             if not known:
                 findings.append(Finding(
@@ -60,9 +64,6 @@ class Checker:
                     "depends on it, anyone can register the name and their code gets installed"))
             return Report(spec, judge(findings, notes))
 
-        squat = load_popular(spec.ecosystem).squats(info.name)
-        if squat:
-            findings.append(Finding("typosquat", f"the name looks like {squat.how}"))
         findings += metadata_findings(info)
 
         if not self.read_code:
@@ -81,8 +82,8 @@ class Checker:
             return []
         try:
             advisories = self.osv.lookup(spec.ecosystem, spec.name, version)
-        except (http.FetchError, ValueError, AttributeError) as e:
-            notes.append(f"couldn't reach OSV for the known-malware lookup: {e}")
+        except (http.FetchError, ValueError, AttributeError):
+            notes.append("couldn't reach OSV.dev, so the known-malware lookup was skipped")
             return []
         if advisories.vulnerabilities:
             count = len(advisories.vulnerabilities)

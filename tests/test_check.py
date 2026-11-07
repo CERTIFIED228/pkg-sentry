@@ -114,7 +114,12 @@ def test_offline_and_osv_down_are_noted():
     offline = Checker(registry, None).check(PackageSpec("pypi", "tidy"))
     assert "known-malware lookup skipped (offline)" in offline.verdict.notes
     down = Checker(registry, FakeOSV(down=True)).check(PackageSpec("pypi", "tidy"))
-    assert any("couldn't reach OSV" in n for n in down.verdict.notes)
+    assert "couldn't reach OSV.dev, so the known-malware lookup was skipped" in down.verdict.notes
+
+
+def test_missing_typo_name_says_what_was_meant():
+    report = Checker(FakeRegistry(), FakeOSV()).check(PackageSpec("pypi", "reqeusts"))
+    assert sorted(f.rule for f in report.verdict.findings) == ["not-found", "typosquat"]
 
 
 def test_no_code_mode_uses_registry_scripts():
