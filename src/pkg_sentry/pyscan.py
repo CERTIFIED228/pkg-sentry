@@ -28,11 +28,14 @@ SHELL = {"os.system", "os.popen", "os.startfile", "pty.spawn", "commands.getoutp
 SHELL_PREFIXES = ("subprocess.", "os.exec", "os.spawn", "os.posix_spawn")
 NETWORK_PREFIXES = ("urllib.request.urlopen", "urllib.request.urlretrieve",
                     "urllib.request.Request", "urllib2.urlopen", "urllib.urlopen",
-                    "urllib.urlretrieve", "requests.",
-                    "httpx.", "http.client.HTTP", "socket.socket", "socket.create_connection",
-                    "aiohttp.ClientSession", "smtplib.SMTP", "ftplib.FTP", "dns.resolver.",
-                    "socket.gethostbyname", "socket.getaddrinfo", "wget.download",
-                    "pycurl.Curl", "websocket.", "telebot.", "discord_webhook.")
+                    "urllib.urlretrieve", "requests.get", "requests.post", "requests.put",
+                    "requests.patch", "requests.delete", "requests.head", "requests.request",
+                    "requests.Session", "requests.session", "requests.api.", "httpx.get",
+                    "httpx.post", "httpx.put", "httpx.request", "httpx.stream", "httpx.Client",
+                    "httpx.AsyncClient", "http.client.HTTP", "socket.socket",
+                    "socket.create_connection", "aiohttp.ClientSession", "smtplib.SMTP",
+                    "ftplib.FTP", "dns.resolver.", "socket.gethostbyname", "socket.getaddrinfo",
+                    "wget.download", "pycurl.Curl", "websocket.", "telebot.", "discord_webhook.")
 RECON = {"socket.gethostname", "getpass.getuser", "os.getlogin", "platform.node", "platform.uname",
          "os.uname", "uuid.getnode"}
 LOOKUPS = {"socket.gethostbyname", "socket.getaddrinfo", "socket.gethostbyname_ex",

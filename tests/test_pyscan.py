@@ -491,3 +491,9 @@ class build_stuff(Command):
 setup(cmdclass={"import_data": import_data, "build_py": build_stuff})
 '''
     assert file_references(code) == {"scripts/build.sh"}
+
+
+def test_requests_helpers_arent_network_calls():
+    code = "import requests\nUA = requests.utils.default_user_agent()\nr = requests.get('https://x')"
+    found = scan_python("pkg/m.py", code, "import")
+    assert [f.line for f in found if f.rule == "network-at-install"] == [3]

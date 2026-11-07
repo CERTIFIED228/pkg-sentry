@@ -213,8 +213,11 @@ def test_compiled_python():
 
 
 def test_a_top_level_package_called_tools_is_the_library():
-    files = {"tools/__init__.py": "import os\nos.system('id')"}
+    # In a wheel, the top level is what gets installed into site-packages.
+    files = {"tools/__init__.py": "import os\nos.system('id')", "x-1.0.dist-info/METADATA": ""}
     assert rules(files) == ["shell-at-install"]
+    # In an sdist, a top-level tests/ or tools/ folder is the project's own tooling.
+    assert rules({"tests/__init__.py": "", "tests/qa.py": "import os\nos.system('ls')"}) == []
     assert is_dev_file("tools/x.py")
     assert not is_dev_file("tools/x.py", {"tools"})
     assert not is_dev_file("src/tools/x.py", {"src/tools"})

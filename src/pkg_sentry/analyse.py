@@ -71,6 +71,10 @@ def analyse(unpacked: Unpacked, ecosystem: str | None = None) -> list[Finding]:
     findings += _unread(unpacked)
 
     packages = {posixpath.dirname(p) for p in files if posixpath.basename(p) == "__init__.py"}
+    # A wheel's top level is what lands in site-packages, so a package there
+    # called tools/ is the library. In an sdist it's the project's tooling.
+    wheel = any(p.split("/", 1)[0].endswith(".dist-info") for p in files)
+    installed = packages if wheel else frozenset()
     install_files: set[str] = set()
     setup_files: dict[str, str] = {}
     if ecosystem == "npm":
@@ -91,7 +95,7 @@ def analyse(unpacked: Unpacked, ecosystem: str | None = None) -> list[Finding]:
         ext = posixpath.splitext(path)[1].lower()
         install = path in install_files or path in setup_files
         foreign = ext in FOREIGN_CODE and ext not in OWN_CODE.get(ecosystem, FOREIGN_CODE)
-        dev = not install and (foreign or is_dev_file(path, packages))
+        dev = not install and (foreign or is_dev_file(path, installed))
         found = _check_file(path, f, ecosystem, setup_files, install_files, packages, dev)
         if dev:
             found = [x for x in found if x.rule in STRONG]
