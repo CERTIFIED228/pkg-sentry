@@ -7,9 +7,11 @@ bombs. Anything skipped is reported rather than silently dropped.
 """
 
 import io
+import lzma
 import posixpath
 import tarfile
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 
 
@@ -20,7 +22,7 @@ class ArchiveError(Exception):
 @dataclass(frozen=True)
 class Limits:
     max_files: int = 20_000
-    max_file_bytes: int = 10_000_000
+    max_file_bytes: int = 25_000_000
     max_total_bytes: int = 300_000_000
     # Declared sizes of everything, read or not. Skipping a member of a
     # compressed tar still means decompressing it, so this caps the work.
@@ -57,17 +59,36 @@ class Unpacked:
 DEFAULT_LIMITS = Limits()
 
 
+BROKEN = (tarfile.TarError, EOFError, OSError, ValueError, zlib.error, lzma.LZMAError)
+
+
 def unpack(
-    data: bytes, limits: Limits = DEFAULT_LIMITS, password: bytes | None = None
+    data: bytes, limits: Limits = DEFAULT_LIMITS, password: bytes | None = None,
+    npm: bool = False,
 ) -> Unpacked:
+    """npm=True reads a tarball the way npm installs it (see npm_path)."""
     if data[:4] in (b"PK\x03\x04", b"PK\x05\x06"):
         return _unpack_zip(data, limits, password)
     try:
-        archive = tarfile.open(fileobj=io.BytesIO(data), mode="r:*")
-    except (tarfile.TarError, EOFError, OSError) as e:
+        # Streaming mode, so tarfile doesn't keep every entry in memory.
+        archive = tarfile.open(fileobj=io.BytesIO(data), mode="r|*")
+    except BROKEN as e:
         raise ArchiveError(f"not a zip or tar archive ({e})") from None
     with archive:
-        return _unpack_tar(archive, limits)
+        return _unpack_tar(archive, limits, npm_path if npm else clean_path)
+
+
+def npm_path(name: str) -> str | None:
+    """Where npm puts an entry: it drops a leading "/" and the first folder of
+    every entry (not just a shared "package/"), so "anything/index.js" lands
+    as index.js. Later entries overwrite earlier ones."""
+    name = name.replace("\\", "/").lstrip("/")
+    if len(name) > 1 and name[1] == ":":
+        name = name[2:].lstrip("/")
+    parts = [p for p in name.split("/") if p not in ("", ".")]
+    if len(parts) < 2:
+        return ""
+    return clean_path("/".join(parts[1:]))
 
 
 def clean_path(name: str) -> str | None:
@@ -86,12 +107,15 @@ class _Budget:
         self.limits, self.result = limits, result
         self.count = self.total = self.declared = 0
 
+    def count_entry(self) -> None:
+        # Folders and links count too: millions of empty entries are a DoS.
+        self.count += 1
+        if self.count > self.limits.max_files:
+            raise _Stop(f"more than {self.limits.max_files:,} entries")
+
     def allow(self, name: str, size: int) -> bool:
         limits, result = self.limits, self.result
-        self.count += 1
         self.declared += size
-        if self.count > limits.max_files:
-            raise _Stop(f"more than {limits.max_files:,} files")
         if self.declared > limits.max_declared_bytes:
             raise _Stop(f"more than {limits.max_declared_bytes:,} bytes unpacked")
         if size > limits.max_file_bytes:
@@ -107,12 +131,17 @@ class _Stop(Exception):
     pass
 
 
-def _unpack_tar(archive: tarfile.TarFile, limits: Limits) -> Unpacked:
+def _unpack_tar(archive: tarfile.TarFile, limits: Limits, place) -> Unpacked:
     result = Unpacked()
     budget = _Budget(limits, result)
+    files: dict[str, File] = {}
     try:
         for member in archive:
-            path = clean_path(member.name)
+            archive.members.clear()
+            budget.count_entry()
+            path = place(member.name)
+            if path == "":
+                continue
             if path is None:
                 result.suspicious.append((member.name, "path points outside the package"))
                 continue
@@ -126,17 +155,15 @@ def _unpack_tar(archive: tarfile.TarFile, limits: Limits) -> Unpacked:
                 else:
                     result.skipped.append((path, kind))
                 continue
-            if not member.isfile():
-                continue
-            if not budget.allow(path, member.size):
+            if not member.isfile() or not budget.allow(path, member.size):
                 continue
             handle = archive.extractfile(member)
-            body = handle.read(member.size) if handle else b""
-            result.files.append(File(path, body))
+            files[path] = File(path, handle.read(member.size) if handle else b"")
     except _Stop as e:
         result.skipped.append(("*", f"stopped reading: {e}"))
-    except (tarfile.TarError, EOFError, OSError, ValueError) as e:
+    except BROKEN as e:
         result.skipped.append(("*", f"archive is damaged: {e}"))
+    result.files = list(files.values())
     return result
 
 
@@ -150,6 +177,7 @@ def _unpack_zip(data: bytes, limits: Limits, password: bytes | None) -> Unpacked
     with archive:
         try:
             for info in archive.infolist():
+                budget.count_entry()
                 if info.is_dir():
                     continue
                 path = clean_path(info.filename)
@@ -166,7 +194,7 @@ def _unpack_zip(data: bytes, limits: Limits, password: bytes | None) -> Unpacked
                     with archive.open(info, pwd=password) as handle:
                         # The header's size can lie, so cap the read too.
                         body = handle.read(limits.max_file_bytes + 1)
-                except (RuntimeError, zipfile.BadZipFile, NotImplementedError, OSError) as e:
+                except (RuntimeError, zipfile.BadZipFile, NotImplementedError, *BROKEN) as e:
                     result.skipped.append((path, f"can't be read: {e}"))
                     continue
                 if len(body) > limits.max_file_bytes:

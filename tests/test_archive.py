@@ -92,7 +92,7 @@ def test_stops_after_too_many_files():
     data = make_tar([(f"f{i}.py", b"") for i in range(10)])
     result = unpack(data, Limits(max_files=3))
     assert len(result.files) == 3
-    assert "more than 3 files" in result.skipped[-1][1]
+    assert "more than 3 entries" in result.skipped[-1][1]
 
 
 def test_stops_when_total_is_too_big():
@@ -140,3 +140,40 @@ def test_strip_top_dir():
 )
 def test_clean_path(name, expected):
     assert clean_path(name) == expected
+
+
+def test_npm_layout_drops_the_first_folder_of_every_entry():
+    data = make_tar([("aaa/package.json", b'{"name": "decoy"}'),
+                     ("package/package.json", b'{"name": "real"}'),
+                     ("zzz/lib/index.js", b"x"),
+                     ("/abs/evil.js", b"y"),
+                     ("toplevel.js", b"z")])
+    result = unpack(data, npm=True)
+    files = {f.path: f.data for f in result.files}
+    # npm keeps the last package.json, and installs what it finds under any folder
+    assert files == {"package.json": b'{"name": "real"}', "lib/index.js": b"x",
+                     "evil.js": b"y"}
+
+
+def test_npm_layout_still_reports_climbing_out():
+    result = unpack(make_tar([("package/../../x.js", b"x")]), npm=True)
+    assert result.files == [] and result.suspicious
+
+
+def test_folders_and_links_count_towards_the_entry_limit():
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for i in range(50):
+            info = tarfile.TarInfo(f"d{i}")
+            info.type = tarfile.DIRTYPE
+            tar.addfile(info)
+    result = unpack(buf.getvalue(), Limits(max_files=10))
+    assert "more than 10 entries" in result.skipped[-1][1]
+
+
+def test_corrupt_zip_member_is_reported_not_raised():
+    data = bytearray(make_zip([("a.py", b"print(1)" * 500), ("b.py", b"ok")]))
+    start = data.index(b"a.py") + 10
+    data[start:start + 40] = b"\xff" * 40
+    result = unpack(bytes(data))
+    assert any("can't be read" in why for _, why in result.skipped)
