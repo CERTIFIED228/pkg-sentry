@@ -46,6 +46,7 @@ def load_sample(path: Path) -> Unpacked:
             continue
         result.files += [File(f"{f.path}/{g.path}", g.data) for g in inner.files]
         result.suspicious += inner.suspicious
+        result.skipped += inner.skipped
     result.files = [File(_undouble(f.path), f.data) for f in result.files if f not in nested]
     return result.strip_top_dir()
 
@@ -97,6 +98,8 @@ def popular(root: Path, split: str):
                         continue
                     merged.files += [File(f"{filename}/{f.path}", f.data) for f in part.files]
                     merged.suspicious += part.suspicious
+                    # Code that couldn't be read counts against a package, so it's measured too.
+                    merged.skipped += part.skipped
                 return merged
 
             yield ecosystem, info["name"], "popular", load
