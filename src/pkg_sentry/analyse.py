@@ -22,7 +22,7 @@ from .textrules import binary_kind, check_text
 TEXT_EXTENSIONS = {".py", ".js", ".cjs", ".mjs", ".ts", ".json", ".txt", ".md", ".rst", ".cfg",
                    ".toml", ".yml", ".yaml", ".css", ".html", ".png", ".jpg", ".jpeg", ".gif",
                    ".svg", ".ico", ".woff", ".ttf", ".pyi", ".map"}
-DROPPED_PROGRAMS = {".exe", ".scr", ".vbs", ".bat", ".cmd", ".ps1", ".msi", ".com", ".jar"}
+DROPPED_PROGRAMS = {".exe", ".scr", ".msi"}
 SCRIPTS = {".sh", ".bash", ".bat", ".cmd", ".ps1", ".vbs"}
 JS = {".js", ".cjs", ".mjs"}
 DEV_DIRS = {"example", "examples", "docs", "doc", "scripts", "benchmarks", "benchmark", "bench",
@@ -54,6 +54,7 @@ def analyse(unpacked: Unpacked, ecosystem: str | None = None) -> list[Finding]:
             findings += found
             base = posixpath.dirname(root)
             install_files = {posixpath.join(base, f) for f in run_files}
+    packages = {posixpath.dirname(p) for p in files if posixpath.basename(p) == "__init__.py"}
     # Local modules that setup.py imports run during install too.
     setup_dirs: dict[str, set[str]] = {}
     for path, f in files.items():
@@ -62,7 +63,7 @@ def analyse(unpacked: Unpacked, ecosystem: str | None = None) -> list[Finding]:
 
     for path, f in files.items():
         dev = is_dev_file(path) and path not in install_files
-        found = _check_file(path, f, setup_dirs, install_files, dev)
+        found = _check_file(path, f, setup_dirs, install_files, packages, dev)
         if dev:
             found = [x for x in found if x.rule in STRONG]
         findings += found
@@ -71,7 +72,7 @@ def analyse(unpacked: Unpacked, ecosystem: str | None = None) -> list[Finding]:
     return _without_duplicates(findings)
 
 
-def _check_file(path, f, setup_dirs, install_files, dev) -> list[Finding]:
+def _check_file(path, f, setup_dirs, install_files, packages, dev) -> list[Finding]:
     name = posixpath.basename(path)
     ext = posixpath.splitext(name)[1].lower()
     kind = binary_kind(f.data[:72])
@@ -82,7 +83,7 @@ def _check_file(path, f, setup_dirs, install_files, dev) -> list[Finding]:
     if ext in DROPPED_PROGRAMS:
         found.append(Finding("binary-payload", f"ships {name}", path))
     if ext == ".py":
-        role = "runtime" if dev else _python_role(path, setup_dirs)
+        role = "runtime" if dev else _python_role(path, setup_dirs, packages)
         found += scan_python(path, f.text(), role)
     elif ext == ".pth":
         found += _check_pth(path, f.text())
@@ -100,14 +101,15 @@ def is_dev_file(path: str) -> bool:
     return bool(DEV_FILES.match(posixpath.basename(path)))
 
 
-def _python_role(path: str, setup_dirs: dict[str, set[str]]) -> str:
+def _python_role(path: str, setup_dirs: dict[str, set[str]], packages: set[str]) -> str:
     folder, name = posixpath.split(path)
     stem = name[:-3]
     if name == "setup.py" or stem in setup_dirs.get(folder, ()):
         return "setup"
-    # Module-level code in any module runs when it's imported. A file whose
-    # name isn't a valid identifier (run-bench.py) can't be imported.
-    return "import" if stem.isidentifier() else "runtime"
+    # Module-level code runs when the module is imported. That needs a name
+    # Python can import (not run-bench.py) inside a package, or at the top.
+    importable = folder in packages or folder in ("", "src") or folder in setup_dirs
+    return "import" if stem.isidentifier() and importable else "runtime"
 
 
 def _check_pth(path: str, text: str) -> list[Finding]:

@@ -31,10 +31,17 @@ def test_modules_setup_py_imports_run_at_install_too():
 def test_import_time_code_in_any_module():
     found = rules({"pkg/__init__.py": "", "pkg/client.py": "import requests\nrequests.get('x')"})
     assert found == ["network-at-install"]
+    assert rules({"beacon.py": "import requests\nrequests.get('x')"}) == ["network-at-install"]
+
+
+def test_files_outside_any_package_cant_be_imported():
+    found = rules({"vendored/packaging/release.py": "import subprocess\nsubprocess.run('x')"})
+    assert found == ["shell"]
 
 
 def test_scripts_that_cant_be_imported():
-    assert rules({"tools-x/run-bench.py": "import subprocess\nsubprocess.run('x')"}) == ["shell"]
+    files = {"pkg/__init__.py": "", "pkg/run-bench.py": "import subprocess\nsubprocess.run('x')"}
+    assert rules(files) == ["shell"]
 
 
 @pytest.mark.parametrize(
@@ -87,6 +94,7 @@ def test_program_disguised_as_an_image():
 
 def test_shipped_programs():
     assert rules({"bin/update.exe": b"MZ" + b"\0" * 100}) == ["binary-payload"]
+    assert rules({"pkg/run_tests.bat": "@echo off"}) == []
 
 
 def test_pth_file_with_code():

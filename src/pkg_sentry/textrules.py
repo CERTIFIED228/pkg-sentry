@@ -75,9 +75,31 @@ def public_ip(text: str) -> bool:
     return ip.is_global
 
 
+# Plain substrings each pattern needs. Checking these first is far cheaper
+# than running the regexes over every line of a big library.
+GATES = {
+    "exfil": ("discord", "telegram", "ngrok", "pipedream", "webhook", "requestbin", "hookbin",
+              "beeceptor", "interact.sh", "oast", "burpcollaborator", "dnslog", "ceye", "canary",
+              "transfer.sh", "file.io", "gofile", "anonfiles", "pastebin", "paste.ee", "rentry"),
+    "loot": ("login data", "local state", "web data", "cookies", "key4.db", "local storage",
+             "tdata", "wallet", "electrum", "nkbihfbeogaeaoehlefnkodbefgpgknn", "/etc/shadow",
+             "keychain"),
+    "creds": (".ssh", ".git-credentials", ".npmrc", ".pypirc", ".aws", ".azure", "gcloud",
+              ".docker", ".kube"),
+    "powershell": ("powershell", "pwsh"),
+    "pipe": ("curl", "wget", "iwr", "irm", "invoke-web", "invoke-rest", "certutil", "bitsadmin",
+             "mshta"),
+    "persist": ("startup", "currentversion", "schtasks", "crontab", "/etc/cron", "launchagents",
+                "systemctl", "at.exe", "bashrc", "zshrc", "bash_profile", ".profile"),
+    "ip": ("://",),
+}
+
+
 def check_text(text: str, path: str, line_of=None, install_time: bool = False) -> list[Finding]:
     """String-level checks. `line_of(offset)` maps a match back to a line."""
     line_of = line_of or (lambda pos: text.count("\n", 0, pos) + 1)
+    lower = text.lower()
+    gate = {name: any(word in lower for word in words) for name, words in GATES.items()}
     found = []
 
     def add(rule, message, match, critical=False):
@@ -85,26 +107,33 @@ def check_text(text: str, path: str, line_of=None, install_time: bool = False) -
         found.append(Finding(rule, message, path, line_of(match.start()),
                              snippet(text[start: match.end() + 30]), critical))
 
-    for m in EXFIL.finditer(text):
-        add("exfil-endpoint", f"sends data to {m.group(0).split('/')[0]}", m,
-            critical=install_time)
-    for m in STOLEN_GOODS.finditer(text):
-        add("secrets", f"reads {m.group(0)}", m)
-    for m in CREDENTIALS.finditer(text):
-        add("credentials", f"reads {m.group(0)}", m)
-    for m in POWERSHELL.finditer(text):
-        window = text[m.start(): m.start() + 300]
-        if POWERSHELL_HIDING.search(window):
-            add("hidden-powershell", "starts PowerShell hidden or with encoded commands", m,
+    if gate["exfil"]:
+        for m in EXFIL.finditer(text):
+            add("exfil-endpoint", f"sends data to {m.group(0).split('/')[0]}", m,
                 critical=install_time)
-    for m in PIPE_TO_SHELL.finditer(text):
-        add("download-exec", "downloads a script or program and runs it", m,
-            critical=install_time)
-    for m in PERSISTENCE.finditer(text):
-        add("persistence", "sets itself up to start again later", m)
-    for m in URL_IP.finditer(text):
-        if public_ip(m.group(1)):
-            add("raw-ip-url", f"talks to the bare IP address {m.group(1)}", m)
+    if gate["loot"]:
+        for m in STOLEN_GOODS.finditer(text):
+            add("secrets", f"reads {m.group(0)}", m)
+    if gate["creds"]:
+        for m in CREDENTIALS.finditer(text):
+            add("credentials", f"reads {m.group(0)}", m)
+    if gate["powershell"]:
+        for m in POWERSHELL.finditer(text):
+            window = text[m.start(): m.start() + 300]
+            if POWERSHELL_HIDING.search(window):
+                add("hidden-powershell", "starts PowerShell hidden or with encoded commands", m,
+                    critical=install_time)
+    if gate["pipe"]:
+        for m in PIPE_TO_SHELL.finditer(text):
+            add("download-exec", "downloads a script or program and runs it", m,
+                critical=install_time)
+    if gate["persist"]:
+        for m in PERSISTENCE.finditer(text):
+            add("persistence", "sets itself up to start again later", m)
+    if gate["ip"]:
+        for m in URL_IP.finditer(text):
+            if public_ip(m.group(1)):
+                add("raw-ip-url", f"talks to the bare IP address {m.group(1)}", m)
     return found
 
 
