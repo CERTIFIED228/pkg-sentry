@@ -5,6 +5,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from urllib.parse import quote
 
+from packaging.tags import sys_tags
+from packaging.utils import InvalidWheelFilename, parse_wheel_filename
+
 from . import http
 from .spec import PackageSpec
 
@@ -35,17 +38,19 @@ class PackageInfo:
     summary: str = ""
     homepage: str | None = None
     repository: str | None = None
-    author: str | None = None
     created: datetime | None = None
     released: datetime | None = None
     previous_release: datetime | None = None
-    release_count: int = 0
-    install_scripts: dict[str, str] = field(default_factory=dict)
+    # npm only: every script, because install hooks can call the others.
+    scripts: dict[str, str] = field(default_factory=dict)
     artifacts: list[Artifact] = field(default_factory=list)
     deprecated: str | None = None
-    provenance: bool = False
     # npm swaps confirmed malware for an empty "security holding package".
     removed_as_malware: bool = False
+
+    @property
+    def install_scripts(self) -> dict[str, str]:
+        return {k: self.scripts[k] for k in NPM_INSTALL_HOOKS if self.scripts.get(k)}
 
 
 class Registry:
@@ -61,81 +66,112 @@ class Registry:
         return http.get(artifact.url, max_bytes=max_bytes, timeout=self.timeout * 3)
 
     def _pypi(self, spec: PackageSpec) -> PackageInfo:
-        doc = http.get_json(f"{self.pypi_url}/pypi/{quote(spec.name)}/json", timeout=self.timeout)
-        meta = doc["info"]
-        version = spec.version or meta["version"]
-        releases = {v: files for v, files in doc.get("releases", {}).items() if files}
+        doc = _dict(http.get_json(f"{self.pypi_url}/pypi/{quote(spec.name)}/json",
+                                  timeout=self.timeout))
+        meta = _dict(doc.get("info"))
+        name = _str(meta.get("name")) or spec.name
+        version = spec.version or _str(meta.get("version"))
+        if not version:
+            raise http.FetchError(f"PyPI's answer for {spec.name} has no version in it")
+        releases = {v: _files(files) for v, files in _dict(doc.get("releases")).items()}
+        releases = {v: files for v, files in releases.items() if files}
         if version not in releases:
             if spec.version:
-                raise VersionNotFound(f"{meta['name']} has no release {version} on PyPI")
-            releases[version] = doc.get("urls", [])
+                raise VersionNotFound(f"{name} has no release {version} on PyPI")
+            releases[version] = _files(doc.get("urls"))
 
-        uploaded = {v: min(_time(f["upload_time_iso_8601"]) for f in files)
-                    for v, files in releases.items() if files}
-        urls = {k.lower(): v for k, v in (meta.get("project_urls") or {}).items() if v}
-        homepage = meta.get("home_page") or urls.get("homepage")
+        uploaded = {}
+        for v, files in releases.items():
+            times = [t for f in files if (t := _time(f.get("upload_time_iso_8601")))]
+            if times:
+                uploaded[v] = min(times)
+        urls = {k.lower(): v for k, v in _dict(meta.get("project_urls")).items()
+                if isinstance(k, str) and _str(v)}
+        homepage = _str(meta.get("home_page")) or urls.get("homepage")
         repository = next((urls[k] for k in REPO_KEYS if k in urls), None)
         if not repository and _looks_like_repo(homepage):
             repository = homepage
 
         return PackageInfo(
             ecosystem="pypi",
-            name=meta["name"],
+            name=name,
             version=version,
-            summary=meta.get("summary") or "",
+            summary=_str(meta.get("summary")),
             homepage=homepage,
             repository=repository,
-            author=meta.get("author") or meta.get("author_email"),
             created=min(uploaded.values(), default=None),
             released=uploaded.get(version),
             previous_release=_before(uploaded, version),
-            release_count=len(releases),
             artifacts=_pick_pypi_files(releases[version]),
-            deprecated=(meta.get("yanked_reason") or "yanked") if meta.get("yanked") else None,
+            deprecated=(_str(meta.get("yanked_reason")) or "yanked") if meta.get("yanked")
+            else None,
         )
 
     def _npm(self, spec: PackageSpec) -> PackageInfo:
         url = f"{self.npm_url}/{quote(spec.name, safe='@')}"
-        doc = http.get_json(url, timeout=self.timeout, max_bytes=150_000_000)
-        versions = doc.get("versions") or {}
-        version = spec.version or (doc.get("dist-tags") or {}).get("latest")
+        doc = _dict(http.get_json(url, timeout=self.timeout, max_bytes=150_000_000))
+        versions = _dict(doc.get("versions"))
+        version = spec.version or _str(_dict(doc.get("dist-tags")).get("latest"))
         if version not in versions:
             raise VersionNotFound(f"{spec.name} has no version {version} on npm")
         meta = versions[version]
-        times = {v: _time(t) for v, t in (doc.get("time") or {}).items() if v in versions}
-        scripts = meta.get("scripts") or {}
+        if not isinstance(meta, dict):
+            raise http.FetchError(f"npm's manifest for {spec.name}@{version} is broken")
+        times = {v: t for v, raw in _dict(doc.get("time")).items()
+                 if v in versions and (t := _time(raw))}
+        scripts = {k: v for k, v in _dict(meta.get("scripts")).items()
+                   if isinstance(k, str) and isinstance(v, str)}
         repository = meta.get("repository") or doc.get("repository")
         if isinstance(repository, dict):
             repository = repository.get("url")
-        author = meta.get("author") or doc.get("author")
-        if isinstance(author, dict):
-            author = author.get("name") or author.get("email")
-        dist = meta.get("dist") or {}
+        repository = _str(repository)
+        dist = _dict(meta.get("dist"))
+        tarball = _str(dist.get("tarball"))
 
         return PackageInfo(
             ecosystem="npm",
-            name=doc.get("name", spec.name),
+            name=_str(doc.get("name")) or spec.name,
             version=version,
-            summary=meta.get("description") or doc.get("description") or "",
-            homepage=meta.get("homepage") or doc.get("homepage"),
+            summary=_str(meta.get("description")) or _str(doc.get("description")),
+            homepage=_str(meta.get("homepage")) or _str(doc.get("homepage")) or None,
             repository=repository or None,
-            author=author,
             created=min(times.values(), default=None),
             released=times.get(version),
             previous_release=_before(times, version),
-            release_count=len(versions),
-            install_scripts={k: scripts[k] for k in NPM_INSTALL_HOOKS if scripts.get(k)},
-            artifacts=[Artifact(dist["tarball"].rsplit("/", 1)[-1], dist["tarball"],
-                                dist.get("unpackedSize"))] if dist.get("tarball") else [],
-            deprecated=meta.get("deprecated") or None,
-            provenance=bool((dist.get("attestations") or {}).get("provenance")),
+            scripts=scripts,
+            # No size: unpackedSize is the size after unpacking, not the download.
+            artifacts=[Artifact(tarball.rsplit("/", 1)[-1], tarball)] if tarball else [],
+            deprecated=_str(meta.get("deprecated")) or None,
             removed_as_malware=bool(NPM_PLACEHOLDER.match(version))
-            or "npm/security-holder" in (repository or ""),
+            or "npm/security-holder" in repository,
         )
 
 
-def _time(text: str) -> datetime:
-    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+def _time(text) -> datetime | None:
+    if not isinstance(text, str):
+        return None
+    try:
+        when = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return when if when.tzinfo else None
+
+
+# Registries are trusted to be up, not to be well-formed: anyone can publish
+# odd metadata, so every field is checked for the type it should be.
+def _dict(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _str(value) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _files(value) -> list[dict]:
+    if not isinstance(value, list):
+        return []
+    return [f for f in value if isinstance(f, dict) and _str(f.get("filename"))
+            and _str(f.get("url"))]
 
 
 def _before(uploaded: dict[str, datetime], version: str) -> datetime | None:
@@ -149,20 +185,37 @@ def _looks_like_repo(url: str | None) -> bool:
     return bool(url) and any(h in url for h in ("github.com/", "gitlab.com/", "bitbucket.org/"))
 
 
-def _pick_pypi_files(files: list[dict]) -> list[Artifact]:
-    """The sdist (its setup.py runs on install) and the wheel pip would most
-    likely pick. pip prefers wheels, and a wheel doesn't have to match the
-    sdist, so both are worth reading."""
+def _pick_pypi_files(files: list[dict], tags=None) -> list[Artifact]:
+    """The sdist (its setup.py runs on install) and the wheel pip would pick
+    on this machine. pip prefers wheels, and a wheel doesn't have to match
+    the sdist, so both are worth reading."""
     def artifact(f):
-        return Artifact(f["filename"], f["url"], f.get("size"))
+        size = f.get("size")
+        return Artifact(f["filename"], f["url"], size if isinstance(size, int) else None)
 
     sdists = [f for f in files if f.get("packagetype") == "sdist"]
     wheels = [f for f in files if f["filename"].endswith(".whl")]
     picked = [artifact(sdists[0])] if sdists else []
     if wheels:
-        pure = [w for w in wheels if w["filename"].endswith("-none-any.whl")]
-        best = pure[0] if pure else min(wheels, key=lambda w: w.get("size") or 0)
-        picked.append(artifact(best))
+        picked.append(artifact(_best_wheel(wheels, tags)))
     if not picked and files:
         picked.append(artifact(files[0]))
     return picked
+
+
+def _best_wheel(wheels: list[dict], tags=None) -> dict:
+    # pip ranks wheels by how well their tags fit this machine, so a
+    # Windows-only wheel beats a pure-Python one on Windows.
+    rank = {tag: i for i, tag in enumerate(tags if tags is not None else sys_tags())}
+    best, best_rank = None, len(rank)
+    for wheel in wheels:
+        try:
+            wheel_tags = parse_wheel_filename(wheel["filename"])[3]
+        except InvalidWheelFilename:
+            continue
+        score = min((rank[t] for t in wheel_tags if t in rank), default=len(rank))
+        if score < best_rank:
+            best, best_rank = wheel, score
+    # Nothing fits this machine: read the smallest one as a sample.
+    return best or min(wheels, key=lambda w: w.get("size") if isinstance(w.get("size"), int)
+                       else 0)
