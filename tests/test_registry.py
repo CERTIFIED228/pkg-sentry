@@ -221,3 +221,14 @@ def test_odd_pypi_metadata_doesnt_crash(server):
     server["/pypi/x/json"] = (200, json.dumps(doc).encode(), {})
     info = Registry(pypi_url=server.url).info(PackageSpec("pypi", "x"))
     assert [a.filename for a in info.artifacts] == ["x-1.0.tar.gz"]
+
+
+def test_yanked_comes_from_the_release_files(server):
+    doc = pypi_doc()
+    for f in doc["releases"]["1.0"]:
+        f["yanked"], f["yanked_reason"] = True, "broken build"
+    doc["info"]["yanked"] = False  # this is about the latest release, not 1.0
+    server["/pypi/example-pkg/json"] = (200, json.dumps(doc).encode(), {})
+    registry = Registry(pypi_url=server.url)
+    assert registry.info(PackageSpec("pypi", "example-pkg", "1.0")).deprecated == "broken build"
+    assert registry.info(PackageSpec("pypi", "example-pkg", "2.0")).deprecated is None

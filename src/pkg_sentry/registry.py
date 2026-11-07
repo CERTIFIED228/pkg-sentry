@@ -103,8 +103,7 @@ class Registry:
             released=uploaded.get(version),
             previous_release=_before(uploaded, version),
             artifacts=_pick_pypi_files(releases[version]),
-            deprecated=(_str(meta.get("yanked_reason")) or "yanked") if meta.get("yanked")
-            else None,
+            deprecated=_yanked(releases[version]),
         )
 
     def _npm(self, spec: PackageSpec) -> PackageInfo:
@@ -145,6 +144,15 @@ class Registry:
             removed_as_malware=bool(NPM_PLACEHOLDER.match(version))
             or "npm/security-holder" in repository,
         )
+
+
+def _yanked(files: list[dict]) -> str | None:
+    # The top-level "yanked" is about the latest release; each file says
+    # whether it was yanked itself.
+    gone = [f for f in files if f.get("yanked")]
+    if not gone or len(gone) < len(files):
+        return None
+    return _str(gone[0].get("yanked_reason")) or "yanked"
 
 
 def _time(text) -> datetime | None:
