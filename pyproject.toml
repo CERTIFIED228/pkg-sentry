@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pkg-sentry"
+version = "0.1.0"
+description = "Check PyPI and npm packages for signs of malware before you install them."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Mateusz" }]
+requires-python = ">=3.10"
+dependencies = ["packaging>=23"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+pkg-sentry = "pkg_sentry.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pkg_sentry = ["data/*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]

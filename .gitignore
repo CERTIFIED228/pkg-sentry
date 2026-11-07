@@ -1,0 +1,24 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# tooling
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# benchmark inputs and results (malware samples never go in the repo)
+samples/
+bench-results/
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
