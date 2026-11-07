@@ -142,3 +142,13 @@ def test_error_report():
     report = Report(PackageSpec("pypi", "x", "9"), judge([]), error="x has no release 9")
     assert as_text(report) == "x==9 (PyPI)\n  error: x has no release 9"
     assert summary([report]) == "1 package(s): 1 couldn't be checked"
+
+
+def test_runs_as_a_module():
+    import subprocess
+    import sys
+
+    result = subprocess.run([sys.executable, "-m", "pkg_sentry", "--version"],
+                            capture_output=True, text=True)
+    assert result.returncode == 0
+    assert result.stdout.startswith("pkg-sentry ")

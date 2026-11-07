@@ -197,7 +197,3 @@ def _safe_streams() -> None:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="backslashreplace")
-
-
-if __name__ == "__main__":
-    sys.exit(main())
