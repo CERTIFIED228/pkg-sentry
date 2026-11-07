@@ -19,7 +19,7 @@ from .archive import Unpacked
 from .jsscan import local_requires, scan_gyp, scan_js, scan_package_json
 from .pyscan import file_references, imports_of, scan_python
 from .rules import Finding, snippet
-from .textrules import binary_kind, check_text
+from .textrules import PER_RULE, binary_kind, check_text
 
 TEXT_EXTENSIONS = {".py", ".js", ".cjs", ".mjs", ".ts", ".json", ".txt", ".md", ".rst", ".cfg",
                    ".toml", ".yml", ".yaml", ".css", ".html", ".png", ".jpg", ".jpeg", ".gif",
@@ -62,7 +62,7 @@ def analyse(unpacked: Unpacked, ecosystem: str | None = None) -> list[Finding]:
     files = {f.path: f for f in unpacked.files}
     ecosystem = ecosystem or guess_ecosystem(files)
     findings = [Finding("archive-escape", f"has a file that {why}", path)
-                for path, why in unpacked.suspicious]
+                for path, why in unpacked.suspicious[:PER_RULE]]
     findings += _unread(unpacked)
 
     packages = {posixpath.dirname(p) for p in files if posixpath.basename(p) == "__init__.py"}
@@ -128,9 +128,12 @@ def _check_file(path, f, ecosystem, setup_files, install_files, packages, dev) -
 
 
 def guess_ecosystem(files) -> str:
-    python = any(p in ("setup.py", "PKG-INFO", "pyproject.toml") for p in files) or any(
+    return "npm" if "package.json" in files and not looks_like_python(files) else "pypi"
+
+
+def looks_like_python(files) -> bool:
+    return any(p in ("setup.py", "PKG-INFO", "pyproject.toml") for p in files) or any(
         p.split("/", 1)[0].endswith(".dist-info") for p in files)
-    return "npm" if "package.json" in files and not python else "pypi"
 
 
 def root_package_json(files) -> str | None:

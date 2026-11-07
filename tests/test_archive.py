@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from pkg_sentry.archive import ArchiveError, File, Limits, Unpacked, clean_path, unpack
+from pkg_sentry.archive import ArchiveError, File, Limits, Unpacked, clean_path, npm_path, unpack
 
 DATA = Path(__file__).parent / "data"
 
@@ -150,9 +150,19 @@ def test_npm_layout_drops_the_first_folder_of_every_entry():
                      ("toplevel.js", b"z")])
     result = unpack(data, npm=True)
     files = {f.path: f.data for f in result.files}
-    # npm keeps the last package.json, and installs what it finds under any folder
+    # npm keeps the last package.json, installs what it finds under any folder,
+    # and for "/abs/evil.js" the empty part before the "/" is what gets dropped
     assert files == {"package.json": b'{"name": "real"}', "lib/index.js": b"x",
-                     "evil.js": b"y"}
+                     "abs/evil.js": b"y"}
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [("package/index.js", "index.js"), ("./x/index.js", "x/index.js"), ("index.js", ""),
+     ("a//b/c.js", "b/c.js"), ("package\\lib\\a.js", "lib/a.js"), ("package/../x", None)],
+)
+def test_npm_paths(name, expected):
+    assert npm_path(name) == expected
 
 
 def test_npm_layout_still_reports_climbing_out():

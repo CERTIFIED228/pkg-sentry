@@ -79,16 +79,16 @@ def unpack(
 
 
 def npm_path(name: str) -> str | None:
-    """Where npm puts an entry: it drops a leading "/" and the first folder of
-    every entry (not just a shared "package/"), so "anything/index.js" lands
-    as index.js. Later entries overwrite earlier ones."""
-    name = name.replace("\\", "/").lstrip("/")
-    if len(name) > 1 and name[1] == ":":
-        name = name[2:].lstrip("/")
-    parts = [p for p in name.split("/") if p not in ("", ".")]
-    if len(parts) < 2:
+    """Where npm puts an entry. Like node-tar with strip: 1, it drops the first
+    part of every path whatever it's called (not just a shared "package/"),
+    then any leading "/": "anything/index.js" lands as index.js and
+    "/abs/x.js" as abs/x.js. Later entries overwrite earlier ones."""
+    rest = "/".join(name.replace("\\", "/").split("/")[1:]).lstrip("/")
+    if len(rest) > 1 and rest[1] == ":":
+        rest = rest[2:].lstrip("/")
+    if not rest.strip("/."):
         return ""
-    return clean_path("/".join(parts[1:]))
+    return clean_path(rest)
 
 
 def clean_path(name: str) -> str | None:
