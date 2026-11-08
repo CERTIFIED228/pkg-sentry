@@ -64,7 +64,8 @@ def test_path_traversal_is_reported_not_read(name):
     for data in (make_tar([(name, b"bad"), ("ok.py", b"")]), make_zip([(name, b"bad")])):
         result = unpack(data)
         assert name not in paths(result)
-        assert [s[0] for s in result.suspicious] == [name]
+        reported = [s[0].replace("\\", "/") for s in result.suspicious]
+        assert reported == [name.replace("\\", "/")]
 
 
 def test_links_are_never_followed():

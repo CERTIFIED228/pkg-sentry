@@ -2,9 +2,11 @@ import json
 from datetime import datetime, timezone
 
 import pytest
+from packaging.tags import Tag
 
+import pkg_sentry.registry
 from pkg_sentry import http
-from pkg_sentry.registry import Artifact, Registry, VersionNotFound
+from pkg_sentry.registry import Artifact, Registry, VersionNotFound, _pick_pypi_files
 from pkg_sentry.spec import PackageSpec
 
 
@@ -79,7 +81,9 @@ def test_pypi_latest(registry):
     assert info.previous_release == utc(2021, 3, 1, 10)
 
 
-def test_pypi_reads_the_sdist_and_the_pure_wheel(registry):
+def test_pypi_reads_the_sdist_and_the_pure_wheel(registry, monkeypatch):
+    linux = [Tag("cp312", "cp312", "manylinux_2_17_x86_64"), Tag("py3", "none", "any")]
+    monkeypatch.setattr(pkg_sentry.registry, "sys_tags", lambda: iter(linux))
     info = registry.info(PackageSpec("pypi", "example-pkg"))
     assert [a.filename for a in info.artifacts] == [
         "example_pkg-2.0.tar.gz", "example_pkg-2.0-py3-none-any.whl"]
@@ -169,10 +173,6 @@ def test_download(server):
 
 
 def test_wheels_are_picked_the_way_pip_would_pick_them():
-    from packaging.tags import Tag
-
-    from pkg_sentry.registry import _pick_pypi_files
-
     files = [pypi_file(name, "bdist_wheel", "2024-05-02T10:00:00Z", 100) for name in (
         "p-2.0-py3-none-any.whl", "p-2.0-cp312-cp312-win_amd64.whl",
         "p-2.0-cp312-cp312-manylinux_2_17_x86_64.whl")]
