@@ -1,0 +1,34 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: pip install -e ".[dev]" build
+      - run: pytest
+      - run: python -m build
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<NOTES
+          Install it with:
+
+          \`\`\`
+          pip install https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/pkg_sentry-${GITHUB_REF_NAME#v}-py3-none-any.whl
+          \`\`\`
+
+          then try \`pkg-sentry check requests reqeusts\`. More in the [README](https://github.com/${GITHUB_REPOSITORY}#download-and-try-it).
+          NOTES
+          gh release create "$GITHUB_REF_NAME" dist/* --title "pkg-sentry $GITHUB_REF_NAME" --notes-file notes.md
