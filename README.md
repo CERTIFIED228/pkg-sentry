@@ -17,9 +17,26 @@ bytesp==99.7 (PyPI)  CRITICAL 100/100
   - version 99.7 is the kind used to win over a company's internal package (dependency confusion)
 ```
 
-Attackers publish packages with names one typo away from popular ones (`reqeusts`, `crossenv`), or take over real ones, and the code runs on your machine the moment `pip install` or `npm install` finishes. Registries remove them, but usually after people have installed them.
+## Why I made it
 
-## What it checks
+Scams aren't only fake websites. The apps and sites everyone uses are built out of thousands of free packages that developers download from PyPI (Python) and npm (JavaScript). Attackers publish malware dressed up as those packages, with names one typo away from popular ones (`reqeusts`, `crossenv`), or they take over real ones, and the code runs on the developer's machine the moment `pip install` or `npm install` finishes. From there it can steal passwords and keys, or end up inside software that ordinary people rely on. Registries remove these packages, but usually after people have already installed them.
+
+pkg-sentry is a check you can run first.
+
+## Download and try it
+
+Needs Python 3.10 or newer. The only dependency is `packaging`.
+
+```bash
+pip install https://github.com/CERTIFIED228/pkg-sentry/releases/download/v0.1.1/pkg_sentry-0.1.1-py3-none-any.whl
+pkg-sentry check requests reqeusts
+```
+
+The first one is the real `requests` and comes back OK. The second is a typo of it that nobody owns, which is exactly what an attacker would register, so it's flagged HIGH. On Windows, if `pkg-sentry` isn't recognised, run `python -m pkg_sentry` instead. Every version is on the [releases page](https://github.com/CERTIFIED228/pkg-sentry/releases).
+
+## What it does
+
+Give it a package name (or a whole project's dependency file) and it checks four things:
 
 1. **Known malware.** Looks the package up on [OSV.dev](https://osv.dev), which collects the OpenSSF malicious-packages reports. Works even after the registry has deleted the package. npm's "security holding package" placeholders count too.
 2. **The name.** Compared against the 15,000 most downloaded packages on each registry: one letter off (`colourama`), swapped letters (`reqeusts`), separators dropped (`crossenv` for `cross-env`), look-alike digits (`djang0`), `python3-` prefixes. A dependency that doesn't exist at all is flagged too, because anyone could register it (dependency confusion).
@@ -44,7 +61,12 @@ Attackers publish packages with names one typo away from popular ones (`reqeusts
 
    Code it can't read (a file over the size limit, a damaged archive member) is reported, not skipped, so padding a package doesn't get it through.
 
+## How it works
+
+The package is downloaded into memory, opened the way pip or npm would open it, and read as text. Nothing from it is ever installed or run.
+
 What matters most is *when* code runs. The same `subprocess` call means something different in `setup.py`, which runs during `pip install`, than inside a function nobody calls. So pkg-sentry works out what runs by itself:
+
 - `setup.py`, build backends shipped inside the package, and the files they run or `exec`;
 - modules `setup.py` imports (their top level runs) or calls into (their functions count too, one step deep, so a package's whole build toolchain doesn't look like install code);
 - module-level code in anything inside a package (it runs on import);
@@ -53,17 +75,36 @@ What matters most is *when* code runs. The same `subprocess` call means somethin
 - npm install hooks, the scripts they call, and every file those `require`;
 - tests, docs and CI scripts only count for signs that are never innocent.
 
-## Install
+### How the score works
 
-Needs Python 3.10+. The only dependency is `packaging`.
+Every finding has points. Each kind of finding counts once, however many files it appears in, and the rest stay as evidence in the report.
 
-```bash
-pip install git+https://github.com/CERTIFIED228/pkg-sentry.git
-```
+Findings come in two kinds:
 
-or from a clone: `pip install -e .`
+- **Behaviour** is what honest packages do too: an install script, network access or shell commands during install, shipping an `.exe`, a brand-new package. esbuild downloads and runs a binary when it's installed, and so do a lot of malware droppers. Behaviour alone is capped at 45 points, so it can reach medium but never high.
+- **Evidence** is hard to explain innocently: decoding hidden code and running it, a Discord webhook, reading browser passwords, obfuscation, a typosquatted name. Evidence adds up without a cap.
 
-## Usage
+| Severity | Score | Meaning |
+|---|---|---|
+| Critical | 90+ | known malware, or something that's never innocent at install time (decoding and running hidden code in `setup.py`, sending data to a webhook during install) |
+| High | 60+ | behaviour plus evidence, or several kinds of evidence |
+| Medium | 35+ | worth a look before installing |
+| Low | 15+ | minor signs |
+
+### Keeping the scanner itself safe
+
+The scanner reads hostile input, so it's careful with it:
+
+- Nothing is ever installed, imported, executed or extracted to disk. Archives are read in memory.
+- Every archive member is checked: no symlinks or hard links are followed, paths that climb out of the package (`../../.bashrc`) are reported rather than read, and there are limits on file count, file size, total size and compression ratio (zip bombs).
+- If an archive carries on past the point where Python's tar reader stops (npm's reader goes further), it's reported as not fully read instead of passing as clean.
+- Deeply nested code can't crash the scan (that alone would be a way to hide a payload): the syntax tree is walked without recursion, and if Python can't parse a file at all, the text checks still run on it. Python 3.10 itself crashes on a long enough `1 + 1 + ...` chain, so on 3.10 the file is measured with the tokenizer before it's parsed.
+- Downloads are capped at 100 MB by default, stop reading if a server lies about the size, and a download that's cut off is an error rather than a smaller file.
+- Registry metadata is type-checked rather than trusted, since publishers control most of it.
+- Text from the package is printed with control characters escaped, so a snippet can't use terminal escape codes to wipe the warning and print a fake "OK".
+- One runtime dependency, and HTTP is plain `urllib`. A supply-chain tool with a big dependency tree would be a bit ironic.
+
+## Using it
 
 ```bash
 # one or more packages
@@ -90,35 +131,6 @@ pkg-sentry inspect ./unpacked-folder
 | `--max-download MB` | biggest file to download and read (default 100) |
 
 Exit codes: `0` nothing at or above `--fail-on`, `1` something is, `2` something couldn't be checked or was only partly checked. A package too big to download is reported as "partly checked", never as OK. That makes it easy to put in CI: [docs/github-action.md](docs/github-action.md) has a workflow that blocks pull requests adding a bad dependency.
-
-## How the score works
-
-Every finding has points. Each kind of finding counts once, however many files it appears in, and the rest stay as evidence in the report.
-
-Findings come in two kinds:
-
-- **Behaviour** is what honest packages do too: an install script, network access or shell commands during install, shipping an `.exe`, a brand-new package. esbuild downloads and runs a binary when it's installed, and so do a lot of malware droppers. Behaviour alone is capped at 45 points, so it can reach medium but never high.
-- **Evidence** is hard to explain innocently: decoding hidden code and running it, a Discord webhook, reading browser passwords, obfuscation, a typosquatted name. Evidence adds up without a cap.
-
-| Severity | Score | Meaning |
-|---|---|---|
-| Critical | 90+ | known malware, or something that's never innocent at install time (decoding and running hidden code in `setup.py`, sending data to a webhook during install) |
-| High | 60+ | behaviour plus evidence, or several kinds of evidence |
-| Medium | 35+ | worth a look before installing |
-| Low | 15+ | minor signs |
-
-## Safety
-
-The scanner reads hostile input, so it's careful with it:
-
-- Nothing is ever installed, imported, executed or extracted to disk. Archives are read in memory.
-- Every archive member is checked: no symlinks or hard links are followed, paths that climb out of the package (`../../.bashrc`) are reported rather than read, and there are limits on file count, file size, total size and compression ratio (zip bombs).
-- If an archive carries on past the point where Python's tar reader stops (npm's reader goes further), it's reported as not fully read instead of passing as clean.
-- Deeply nested code can't crash the scan (that alone would be a way to hide a payload): the syntax tree is walked without recursion, and if Python can't parse a file at all, the text checks still run on it.
-- Downloads are capped at 100 MB by default, stop reading if a server lies about the size, and a download that's cut off is an error rather than a smaller file.
-- Registry metadata is type-checked rather than trusted, since publishers control most of it.
-- Text from the package is printed with control characters escaped, so a snippet can't use terminal escape codes to wipe the warning and print a fake "OK".
-- One runtime dependency, and HTTP is plain `urllib`. A supply-chain tool with a big dependency tree would be a bit ironic.
 
 ## How accurate it is
 
@@ -166,6 +178,10 @@ Things to keep in mind:
 ## Development
 
 ```bash
+git clone https://github.com/CERTIFIED228/pkg-sentry.git
+cd pkg-sentry
+python -m venv .venv
+.venv\Scripts\activate          # Windows; on macOS/Linux: source .venv/bin/activate
 pip install -e ".[dev]"
 pytest
 ruff check .
