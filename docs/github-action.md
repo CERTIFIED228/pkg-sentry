@@ -1,6 +1,6 @@
 # Blocking bad dependencies in pull requests
 
-Save this as `.github/workflows/dependencies.yml` in your own project. When a
+Save this as .github/workflows/dependencies.yml in your own project. When a
 pull request changes a dependency file, pkg-sentry checks every package in it
 and the check fails if anything is rated high or critical.
 
@@ -35,7 +35,7 @@ Exit code 2 means a package couldn't be fully checked (too big to download,
 or the registry was down). It fails the step too, because an unchecked
 package isn't a passed one.
 
-`--fail-on medium` makes it stricter. `--json > report.json` gives a file you
+--fail-on medium makes it stricter. --json > report.json gives a file you
 can upload as a build artifact.
 
 pkg-sentry never installs or runs the packages it checks, so it's safe to run
