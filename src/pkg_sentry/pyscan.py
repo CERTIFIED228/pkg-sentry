@@ -12,6 +12,7 @@ import ast
 import codecs
 import io
 import re
+import sys
 import tokenize
 import warnings
 
@@ -81,7 +82,53 @@ def decode_source(data: bytes | str) -> tuple[str, str]:
         return data.decode("utf-8", errors="replace"), "utf-8"
 
 
+MAX_DEPTH = 3000
+DEEPENING_WORDS = {"not", "lambda", "if", "else", "await", "and", "or", "in", "is"}
+
+
+def nests_too_deeply(source: str) -> bool:
+    """Whether an expression in the file might nest more than MAX_DEPTH levels.
+
+    Python 3.11+ refuses to build a tree around that depth. 3.10 doesn't check,
+    and something like `1 + 1 + ... + 1` with enough terms overflows the C
+    stack and kills the whole process, so on 3.10 this is checked first. Each
+    operator in an unbroken run counts as a level, which overestimates: it
+    only has to never underestimate."""
+    if len(source) <= MAX_DEPTH:
+        return False
+    levels, depth = [0], 0
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+            if tok.type == tokenize.NEWLINE:
+                levels, depth = [0], 0
+                continue
+            if tok.type == tokenize.NAME and tok.string not in DEEPENING_WORDS:
+                continue
+            if tok.type not in (tokenize.OP, tokenize.NAME):
+                continue
+            if tok.string in ("(", "[", "{"):
+                levels[-1] += 1
+                depth += 1
+                levels.append(0)
+            elif tok.string in (")", "]", "}"):
+                if len(levels) > 1:
+                    depth -= levels.pop()
+            elif tok.string in (",", ";", "="):
+                depth -= levels[-1]
+                levels[-1] = 0
+            else:
+                levels[-1] += 1
+                depth += 1
+            if depth > MAX_DEPTH:
+                return True
+    except (tokenize.TokenError, SyntaxError):
+        return True
+    return False
+
+
 def parse(source: str) -> ast.Module | None:
+    if sys.version_info < (3, 11) and nests_too_deeply(source):
+        return None
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")

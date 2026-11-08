@@ -1,8 +1,10 @@
+import subprocess
+import sys
 import textwrap
 
 import pytest
 
-from pkg_sentry.pyscan import imports_of, scan_python
+from pkg_sentry.pyscan import imports_of, nests_too_deeply, scan_python
 
 
 def scan(code, role="runtime", path="pkg/mod.py"):
@@ -173,6 +175,31 @@ def test_absurdly_deep_code_does_not_crash_the_scan():
     assert "exfil-endpoint" in rules(deep)
     nested = "x = " + "[" * 5000 + "]" * 5000
     assert rules(nested) == []
+
+
+def test_a_million_term_sum_doesnt_kill_the_process():
+    code = ("from pkg_sentry.pyscan import scan_python\n"
+            "src = 'x = ' + ' + '.join(['1'] * 1_000_000) + '\\nurl = \"https://webhook.site/a\"'\n"
+            "print(sorted({f.rule for f in scan_python('setup.py', src, 'setup')}))")
+    run = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0, run.stderr[-2000:]
+    assert "exfil-endpoint" in run.stdout
+
+
+@pytest.mark.parametrize("code, deep", [
+    ("x = " + " + ".join(["1"] * 3500), True),
+    ("x = a" + ".b" * 3500, True),
+    ("x = f" + "()" * 3500, True),
+    ("x = " + "-" * 3500 + "1", True),
+    ("x = " + " + ".join(["1"] * 2000), False),
+    ("x = [" + ", ".join(["-1"] * 20_000) + "]", False),
+    ("d = {" + ", ".join(f"'k{i}': f(a.b[i] + 1)" for i in range(5000)) + "}", False),
+    ("x = 1 + 1\n" * 5000, False),
+    ("x = (\n" + " +\n".join(["1"] * 3500) + ")", True),
+    ("s = '" + "+" * 10_000 + "'", False),
+])
+def test_depth_check(code, deep):
+    assert nests_too_deeply(code) is deep
 
 
 def test_main_guard_doesnt_run_on_import():
