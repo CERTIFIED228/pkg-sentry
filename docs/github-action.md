@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: "3.12"
       # Pin a release tag or commit so the check can't change under you.
-      - run: pip install git+https://github.com/CERTIFIED228/pkg-sentry.git@v0.1.0
+      - run: pip install git+https://github.com/CERTIFIED228/pkg-sentry.git@v0.1.1
       # Use whichever files your project has. Exit code 1 fails the check.
       - run: pkg-sentry scan requirements.txt
       - run: pkg-sentry scan package-lock.json
